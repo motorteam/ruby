@@ -44,6 +44,8 @@
 #include "eval_intern.h"
 #include "internal.h"
 #include "internal/cmdlineopt.h"
+#include "tape.h"
+#include "tape_view.h"
 #include "internal/cont.h"
 #include "internal/error.h"
 #include "internal/file.h"
@@ -1538,6 +1540,18 @@ proc_long_options(ruby_cmdline_options_t *opt, const char *s, long argc, char **
     else if (is_option_with_arg("crash-report", true, true)) {
         opt->crash_report = s;
     }
+    else if (is_option_with_arg("tape-record", true, true)) {
+        opt->tape_record = s;
+    }
+    else if (is_option_with_arg("tape-replay", true, true)) {
+        opt->tape_replay = s;
+    }
+    else if (is_option_with_arg("tape-inspect", true, false)) {
+        opt->tape_inspect = s;
+    }
+    else if (is_option_with_arg("tape-view", true, false)) {
+        opt->tape_view = s;
+    }
     else {
         rb_raise(rb_eRuntimeError,
                  "invalid option --%s  (-h will show valid options)", s);
@@ -1879,6 +1893,24 @@ ruby_opt_init(ruby_cmdline_options_t *opt)
     extern void rb_zjit_init(bool);
     rb_zjit_init(opt->zjit);
 #endif
+
+    /* Arm the tape after the prelude, so the interpreter's own startup IO and
+     * clock reads stay off it -- only the user program's effects are recorded. */
+    if (opt->tape_record && opt->tape_replay) {
+        rb_raise(rb_eRuntimeError, "--tape-record and --tape-replay are mutually exclusive");
+    }
+    if (opt->tape_record) rb_tape_record_to(opt->tape_record);
+    if (opt->tape_replay) rb_tape_replay_from(opt->tape_replay);
+
+    /* --tape-view is a replay that also builds a call tree, then renders it. */
+    if (opt->tape_view) {
+        rb_tape_replay_from(opt->tape_view);
+        rb_tape_view_enable();
+    }
+
+    /* Init_IO already fixed the std streams' buffering from the *real* terminal,
+     * before the tape existed. Put it back to what the recording saw. */
+    rb_tape_reconcile_stdio_tty();
 
     ruby_set_script_name(opt->script_name);
     if (rb_box_available()) {
@@ -2391,6 +2423,13 @@ process_options(int argc, char **argv, ruby_cmdline_options_t *opt)
              origarg.argc > 0 && origarg.argv && origarg.argv[0] ? origarg.argv[0] :
              ruby_engine);
         show_help(progname, (opt->dump & DUMP_BIT(help)));
+        return Qtrue;
+    }
+
+    /* Inspecting a tape reads it statically -- there is no script to run, so
+     * exit the way --help and --dump do. */
+    if (opt->tape_inspect) {
+        rb_tape_inspect(opt->tape_inspect);
         return Qtrue;
     }
 

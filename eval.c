@@ -35,6 +35,8 @@
 #include "probes.h"
 #include "probes_helper.h"
 #include "ruby/vm.h"
+#include "tape.h"
+#include "tape_view.h"
 #include "vm_core.h"
 #include "ractor_core.h"
 #include "zjit.h"
@@ -205,6 +207,11 @@ rb_ec_cleanup(rb_execution_context_t *ec, enum ruby_tag_type ex)
     volatile VALUE message = Qnil;
     VALUE buf;
 
+    /* The program is done, so the call tree is complete. Stop tracing *before*
+     * teardown: the hook reads bindings off live frames, and once teardown
+     * starts those frames are being dismantled underneath it. */
+    rb_tape_view_stop();
+
     rb_threadptr_interrupt(th);
     rb_threadptr_check_signal(th);
 
@@ -267,6 +274,11 @@ rb_ec_cleanup(rb_execution_context_t *ec, enum ruby_tag_type ex)
     }
 
     rb_ec_finalize(ec);
+
+    /* Seal the tape after finalizers (their IO belongs on it) but before the VM
+     * is torn down, so the recorder can still allocate and warn. */
+    rb_tape_finish(sysex);
+    rb_tape_view_show();
 
     /* unlock again if finalizer took mutexes. */
     rb_threadptr_unlock_all_locking_mutexes(th);

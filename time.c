@@ -44,6 +44,7 @@
 #include "internal/variable.h"
 #include "ruby/encoding.h"
 #include "ruby/util.h"
+#include "tape.h"
 #include "timev.h"
 
 #if defined(_WIN32)
@@ -2020,6 +2021,10 @@ timew2timespec_exact(wideval_t timew, struct timespec *ts)
 void
 rb_timespec_now(struct timespec *ts)
 {
+    if (rb_tape_replaying()) {
+        rb_tape_replay_clock(RB_TAPE_CLOCK_REALTIME, ts);
+        return;
+    }
 #ifdef HAVE_CLOCK_GETTIME
     if (clock_gettime(CLOCK_REALTIME, ts) == -1) {
         rb_sys_fail("clock_gettime");
@@ -2034,6 +2039,9 @@ rb_timespec_now(struct timespec *ts)
         ts->tv_nsec = tv.tv_usec * 1000;
     }
 #endif
+    if (rb_tape_recording()) {
+        rb_tape_record_clock(RB_TAPE_CLOCK_REALTIME, ts);
+    }
 }
 
 /*

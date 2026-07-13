@@ -131,6 +131,7 @@
 #include "internal/object.h"
 #include "internal/process.h"
 #include "internal/thread.h"
+#include "tape.h"
 #include "internal/transcode.h"
 #include "internal/variable.h"
 #include "ruby/io.h"
@@ -261,7 +262,7 @@ rb_update_max_fd(int fd)
 #else
     {
         struct stat buf;
-        err = fstat(fd, &buf) != 0;
+        err = rb_tape_fstat(fd, &buf) != 0;
     }
 #endif
     if (err && errno == EBADF) {
@@ -337,6 +338,13 @@ rb_cloexec_open(const char *pathname, int flags, mode_t mode)
 
     int retry_count = 0;
 
+    /* Return before the cloexec fixups below: they fcntl() the fd, and a
+     * replayed fd was never really opened. Nothing downstream needs them --
+     * every call on this fd is served from the tape too. */
+    if (rb_tape_replaying()) {
+        return rb_tape_replay_open(pathname);
+    }
+
 #ifdef O_CLOEXEC
     /* O_CLOEXEC is available since Linux 2.6.23.  Linux 2.6.18 silently ignore it. */
     flags |= O_CLOEXEC;
@@ -350,6 +358,12 @@ rb_cloexec_open(const char *pathname, int flags, mode_t mode)
         if (retry_count++ >= retry_max_count) break;
 
         sleep(retry_interval);
+    }
+
+    if (rb_tape_recording()) {
+        int e = errno;
+        rb_tape_record_open(pathname, flags, ret, e);
+        errno = e;
     }
 
     if (ret < 0) return ret;
@@ -757,7 +771,7 @@ static int
 is_socket(int fd, VALUE path)
 {
     struct stat sbuf;
-    if (fstat(fd, &sbuf) < 0)
+    if (rb_tape_fstat(fd, &sbuf) < 0)
         rb_sys_fail_path(path);
     return S_ISSOCK(sbuf.st_mode);
 }
@@ -1201,6 +1215,10 @@ internal_read_func(void *ptr)
     struct io_internal_read_struct *iis = ptr;
     ssize_t result;
 
+    if (rb_tape_replaying()) {
+        return (VALUE)rb_tape_replay_read(iis->fd, iis->buf, iis->capa);
+    }
+
     if (iis->timeout && !iis->nonblock) {
         if (io_internal_wait(iis->th, iis->fptr, 0, RB_WAITFD_IN, iis->timeout) == -1) {
             return -1;
@@ -1221,6 +1239,10 @@ internal_read_func(void *ptr)
         }
     }
 
+    if (rb_tape_recording()) {
+        rb_tape_record_read(iis->fd, iis->buf, iis->capa, result);
+    }
+
     return result;
 }
 
@@ -1235,6 +1257,14 @@ internal_write_func(void *ptr)
 {
     struct io_internal_write_struct *iis = ptr;
     ssize_t result;
+
+    /* Replay never re-performs an effect, so the bytes go nowhere: we only
+     * report what the recorded write returned. The bytes themselves are on the
+     * tape (captured as a gather iov), so `tape inspect` still shows exactly
+     * what the program printed. */
+    if (rb_tape_replaying()) {
+        return (VALUE)rb_tape_replay_write(iis->fd, iis->buf, iis->capa);
+    }
 
     if (iis->timeout && !iis->nonblock) {
         if (io_internal_wait(iis->th, iis->fptr, 0, RB_WAITFD_OUT, iis->timeout) == -1) {
@@ -1257,6 +1287,10 @@ internal_write_func(void *ptr)
         }
     }
 
+    if (rb_tape_recording()) {
+        rb_tape_record_write(iis->fd, iis->buf, iis->capa, result);
+    }
+
     return result;
 }
 
@@ -1266,6 +1300,11 @@ internal_writev_func(void *ptr)
 {
     struct io_internal_writev_struct *iis = ptr;
     ssize_t result;
+
+    /* Buffered writes (`puts`) land here rather than in internal_write_func. */
+    if (rb_tape_replaying()) {
+        return (VALUE)rb_tape_replay_writev(iis->fd, iis->iov, iis->iovcnt);
+    }
 
     if (iis->timeout && !iis->nonblock) {
         if (io_internal_wait(iis->th, iis->fptr, 0, RB_WAITFD_OUT, iis->timeout) == -1) {
@@ -1285,6 +1324,10 @@ internal_writev_func(void *ptr)
                 goto retry;
             }
         }
+    }
+
+    if (rb_tape_recording()) {
+        rb_tape_record_writev(iis->fd, iis->iov, iis->iovcnt, result);
     }
 
     return result;
@@ -1404,7 +1447,21 @@ io_flush_buffer_sync(void *arg)
 {
     rb_io_t *fptr = arg;
     long l = fptr->wbuf.len;
-    ssize_t r = write(fptr->fd, fptr->wbuf.ptr+fptr->wbuf.off, (size_t)l);
+    const char *wbuf = fptr->wbuf.ptr + fptr->wbuf.off;
+    ssize_t r;
+
+    /* The buffered-write drain -- where `puts` output actually reaches the fd.
+     * It calls write(2) directly rather than going through internal_write_func,
+     * so it needs its own hook. */
+    if (rb_tape_replaying()) {
+        r = rb_tape_replay_write(fptr->fd, wbuf, (size_t)l);
+    }
+    else {
+        r = write(fptr->fd, wbuf, (size_t)l);
+        if (rb_tape_recording()) {
+            rb_tape_record_write(fptr->fd, wbuf, (size_t)l, r);
+        }
+    }
 
     if (fptr->wbuf.len <= r) {
         fptr->wbuf.off = 0;
@@ -3158,7 +3215,7 @@ remain_size(rb_io_t *fptr)
     rb_off_t siz = READ_DATA_PENDING_COUNT(fptr);
     rb_off_t pos;
 
-    if (fstat(fptr->fd, &st) == 0  && S_ISREG(st.st_mode)
+    if (rb_tape_fstat(fptr->fd, &st) == 0  && S_ISREG(st.st_mode)
 #if defined(__HAIKU__)
         && (st.st_dev > 3)
 #endif
@@ -5334,7 +5391,7 @@ rb_io_isatty(VALUE io)
     rb_io_t *fptr;
 
     GetOpenFile(io, fptr);
-    return RBOOL(isatty(fptr->fd) != 0);
+    return RBOOL(rb_tape_isatty(fptr->fd) != 0);
 }
 
 #if defined(HAVE_FCNTL) && defined(F_GETFD) && defined(F_SETFD) && defined(FD_CLOEXEC)
@@ -5518,14 +5575,14 @@ nogvl_close(void *ptr)
 {
     int *fd = ptr;
 
-    return (void*)(intptr_t)close(*fd);
+    return (void*)(intptr_t)rb_tape_close(*fd);
 }
 
 static int
 maygvl_close(int fd, int keepgvl)
 {
     if (keepgvl)
-        return close(fd);
+        return rb_tape_close(fd);
 
     /*
      * close() may block for certain file types (NFS, SO_LINGER sockets,
@@ -7149,10 +7206,30 @@ rb_fdopen(int fd, const char *modestr)
     return file;
 }
 
+void
+rb_tape_reconcile_stdio_tty(void)
+{
+    if (!RB_TAPE_ACTIVE()) return;
+
+    VALUE ios[3] = { rb_stdin, rb_stdout, rb_stderr };
+    for (int fd = 0; fd < 3; fd++) {
+        /* Under recording this reads the real isatty and writes it to the tape;
+         * under replay it serves the recorded answer. Either way the mode below
+         * ends up matching what the recording saw. */
+        int tty = rb_tape_isatty(fd);
+
+        if (!RB_TYPE_P(ios[fd], T_FILE)) continue;
+        rb_io_t *fptr;
+        GetOpenFile(ios[fd], fptr);
+        if (tty) fptr->mode |= FMODE_TTY | FMODE_DUPLEX;
+        else     fptr->mode &= ~(FMODE_TTY | FMODE_DUPLEX);
+    }
+}
+
 static int
 io_check_tty(rb_io_t *fptr)
 {
-    int t = isatty(fptr->fd);
+    int t = rb_tape_isatty(fptr->fd);
     if (t)
         fptr->mode |= FMODE_TTY|FMODE_DUPLEX;
     return t;
@@ -8559,7 +8636,7 @@ rb_io_reopen(int argc, VALUE *argv, VALUE file)
             if (setvbuf(fptr->stdio_file, NULL, _IONBF, BUFSIZ) != 0)
                 rb_warn("setvbuf() can't be honoured for %"PRIsVALUE, fptr->pathv);
         }
-        else if (fptr->stdio_file == stdout && isatty(fptr->fd)) {
+        else if (fptr->stdio_file == stdout && rb_tape_isatty(fptr->fd)) {
             if (setvbuf(fptr->stdio_file, NULL, _IOLBF, BUFSIZ) != 0)
                 rb_warn("setvbuf() can't be honoured for %"PRIsVALUE, fptr->pathv);
         }
@@ -9214,6 +9291,21 @@ rb_write_error_str(VALUE mesg)
     /* a stopgap measure for the time being */
     if (rb_stderr_to_original_p(out)) {
         size_t len = (size_t)RSTRING_LEN(mesg);
+
+        /* `warn` and uncaught-exception backtraces reach the terminal through
+         * C stdio, not Ruby's IO layer -- so they bypass every write chokepoint
+         * and would be missing from the tape. Capture here instead. Error output
+         * is precisely what a recorded run is most often consulted for. */
+        if (RB_TAPE_ACTIVE()) {
+            int fd = fileno(stderr);
+            if (rb_tape_replaying()) {
+                rb_tape_replay_write(fd, RSTRING_PTR(mesg), len);
+                RB_GC_GUARD(mesg);
+                return;  /* replay re-performs no effect */
+            }
+            rb_tape_record_write(fd, RSTRING_PTR(mesg), len, (ssize_t)len);
+        }
+
 #ifdef _WIN32
         if (isatty(fileno(stderr))) {
             if (rb_w32_write_console(mesg, fileno(stderr)) > 0) return;
@@ -9234,7 +9326,7 @@ int
 rb_stderr_tty_p(void)
 {
     if (rb_stderr_to_original_p(rb_ractor_stderr()))
-        return isatty(fileno(stderr));
+        return rb_tape_isatty(fileno(stderr));
     return 0;
 }
 
@@ -13619,7 +13711,7 @@ rb_stdio_set_default_encoding(void)
     VALUE val = Qnil;
 
 #ifdef _WIN32
-    if (isatty(fileno(stdin))) {
+    if (rb_tape_isatty(fileno(stdin))) {
         rb_encoding *external = rb_locale_encoding();
         rb_encoding *internal = rb_default_internal_encoding();
         if (!internal) internal = rb_default_external_encoding();

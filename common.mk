@@ -196,6 +196,8 @@ COMMONOBJS    = \
 		strftime.$(OBJEXT) \
 		string.$(OBJEXT) \
 		struct.$(OBJEXT) \
+		tape.$(OBJEXT) \
+		tape_view.$(OBJEXT) \
 		symbol.$(OBJEXT) \
 		thread.$(OBJEXT) \
 		time.$(OBJEXT) \

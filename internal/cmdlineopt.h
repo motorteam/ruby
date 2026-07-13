@@ -26,6 +26,12 @@ typedef struct ruby_cmdline_options {
 
     const char *crash_report;
 
+    /* Deterministic record/replay -- see tape.h. Mutually exclusive. */
+    const char *tape_record;
+    const char *tape_replay;
+    const char *tape_inspect;
+    const char *tape_view;
+
     signed int sflag: 2;
     unsigned int xflag: 1;
     unsigned int warning: 1;

@@ -71,6 +71,7 @@
 #include "internal/variable.h"
 #include "ruby_atomic.h"
 #include "ruby/random.h"
+#include "tape.h"
 #include "ruby/ractor.h"
 
 STATIC_ASSERT(int_must_be_32bit_at_least, sizeof(int) * CHAR_BIT >= 32);
@@ -691,10 +692,18 @@ fill_random_bytes_syscall(void *seed, size_t size, int need_secure)
 int
 ruby_fill_random_bytes(void *seed, size_t size, int need_secure)
 {
+    if (rb_tape_replaying()) {
+        return rb_tape_replay_random(seed, size);
+    }
     int ret = fill_random_bytes_syscall(seed, size, need_secure);
-    if (ret == 0) return ret;
-    if (fill_random_bytes_lib(seed, size) == 0) return 0;
-    return fill_random_bytes_urandom(seed, size);
+    if (ret != 0) {
+        if (fill_random_bytes_lib(seed, size) == 0) ret = 0;
+        else ret = fill_random_bytes_urandom(seed, size);
+    }
+    if (rb_tape_recording()) {
+        rb_tape_record_random(seed, size, ret);
+    }
+    return ret;
 }
 
 /* cnt must be 4 or more */

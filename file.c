@@ -129,7 +129,9 @@ int flock(int, int);
 #  undef HAVE_REALPATH
 # endif
 #else
-# define STAT(p, s)      stat((p), (s))
+/* Route every path-based stat through the tape. STAT() is file.c's funnel for
+ * them, so redefining it here covers all six call sites at once. */
+# define STAT(p, s)      rb_tape_stat((p), (s))
 #endif /* _WIN32 */
 
 #ifdef HAVE_STRUCT_STATX_STX_BTIME
@@ -172,6 +174,7 @@ typedef struct timespec stat_timestamp;
 #include "internal/encoding.h"
 #include "internal/error.h"
 #include "internal/file.h"
+#include "tape.h"
 #include "internal/io.h"
 #include "internal/load.h"
 #include "internal/object.h"
@@ -1292,7 +1295,7 @@ static VALUE
 no_gvl_fstat(void *data)
 {
     no_gvl_stat_data *arg = data;
-    return (VALUE)fstat(arg->file.fd, arg->st);
+    return (VALUE)rb_tape_fstat(arg->file.fd, arg->st);
 }
 
 static int

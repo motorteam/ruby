@@ -70,6 +70,7 @@ static const char *const tape_effect_fqn[] = {
     "fs.closedir",
     "env.get",
     "proc.getpid",
+    "fs.mutate",
 };
 
 /* Effect signatures, for the Signature column of `--tape-inspect`. Ruby is
@@ -96,6 +97,7 @@ static const char *const tape_effect_sig[] = {
     "() -> int",                /* fs.closedir */
     "([[byte]]) -> [[byte]]",   /* env.get -- gather: name; scatter: value */
     "() -> int",                /* proc.getpid */
+    "(op, [[byte]]) -> int",    /* fs.mutate -- gather: the path(s); op names which */
 };
 
 /* ── Allocation ───────────────────────────────────────────────────────────────
@@ -281,8 +283,42 @@ static struct {
  */
 static rb_nativethread_lock_t tape_lock;
 
-int rb_tape_recording(void) { return tape.recording && !tape.dropped && !tape.paused; }
-int rb_tape_replaying(void) { return tape.replaying && !tape.paused; }
+/*
+ * The timer thread is not the program.
+ *
+ * It wakes on a wall-clock schedule -- every few milliseconds, whether or not the
+ * program did anything -- and calls rb_hrtime_now() to decide which sleeping
+ * thread is due (timer_thread_check_timeout, thread_pthread.c:3164). The moment
+ * the monotonic clock went on the tape, those reads went on it too, injecting
+ * entries at points with no relationship to the program's own effect stream: a
+ * tape would record `... fs.close, clock.monotonic, fs.open ...` and the next run
+ * would produce `... fs.close, fs.open ...` because the timer happened to fire a
+ * microsecond later. 130 test files diverged exactly this way, in both directions.
+ *
+ * An effect belongs on the tape when the program asked for it. VM infrastructure
+ * running on a timer did not ask for anything, and its clock reads never flow back
+ * into the program -- they only decide *when* a sleeping thread is woken, which
+ * the tape already pins by other means.
+ */
+static rb_nativethread_id_t tape_vm_thread;
+static int tape_vm_thread_known;
+
+void
+rb_tape_thread_off(void)
+{
+    tape_vm_thread = rb_nativethread_self();
+    tape_vm_thread_known = 1;
+}
+
+static int
+tape_on_vm_thread(void)
+{
+    return tape_vm_thread_known &&
+           rb_nativethread_self() == tape_vm_thread;
+}
+
+int rb_tape_recording(void) { return tape.recording && !tape.dropped && !tape.paused && !tape_on_vm_thread(); }
+int rb_tape_replaying(void) { return tape.replaying && !tape.paused && !tape_on_vm_thread(); }
 
 /*
  * A `require` reaches the filesystem twice, and only one of the two halves is
@@ -944,6 +980,140 @@ rb_tape_isatty(int fd)
 int rb_tape_stat(const char *path, struct stat *st)  { return tape_stat(RB_TAPE_FS_STAT,  path, -1, st, call_stat); }
 int rb_tape_lstat(const char *path, struct stat *st) { return tape_stat(RB_TAPE_FS_LSTAT, path, -1, st, call_lstat); }
 int rb_tape_fstat(int fd, struct stat *st)           { return tape_stat(RB_TAPE_FS_FSTAT, NULL, fd, st, call_fstat); }
+
+/* ── Effect: filesystem mutation ──────────────────────────────────────────────
+ *
+ * These were the last effects still running for real during replay, and they made
+ * "replay is hermetic" false in the quietest way available: a replayed run
+ * reported `no divergence` while creating a directory on the real disk. It
+ * half-executed -- the mkdir ran, the write inside it was suppressed.
+ *
+ * The leak was not the worst of it. A program that *cleans up after itself* could
+ * not be replayed at all: the recording run deleted its temp file, so the replay
+ * run's unlink hit ENOENT and raised. Writing a temp file and removing it is what
+ * most of a test suite does.
+ *
+ * On replay these touch nothing and serve the recorded result, exactly as read,
+ * write and open already do. The filesystem is entirely virtual: the mkdir is
+ * suppressed, and the stat that observes it afterwards comes off the tape saying
+ * the directory is there.
+ */
+static const char *const tape_fs_op_name[] = {
+    "mkdir", "rmdir", "unlink", "rename", "chmod", "fchmod", "chown",
+    "lchown", "symlink", "link", "truncate", "ftruncate", "utimes",
+};
+
+static int
+fs_mutate_replay(int op, const char *a, const char *b)
+{
+    const tape_entry *e = tape_next(RB_TAPE_FS_MUTATE);
+
+    if (e->args.len >= 4) {
+        int rec_op = (int)get_u32(e->args.ptr);
+        if (rec_op != op) {
+            tape_diverged("entry %zu: recorded fs.%s, but the program called fs.%s",
+                          tape.cursor - 1,
+                          rec_op < RB_TAPE_FS_OP_MAX ? tape_fs_op_name[rec_op] : "?",
+                          op < RB_TAPE_FS_OP_MAX ? tape_fs_op_name[op] : "?");
+        }
+    }
+    /* The paths are gather args, so replay checks them -- a program that unlinks a
+     * different file than it recorded has diverged. */
+    if (a) check_path_diverged(e, a);
+    (void)b;
+
+    return take_result(e);
+}
+
+static void
+fs_mutate_record(int op, const char *a, const char *b, int ret, int err)
+{
+    if (!rb_tape_recording()) return;
+    tape_entry *e = entry_begin(RB_TAPE_FS_MUTATE);
+    if (!e) return;
+    put_u32(&e->args, (uint32_t)op);
+    if (a) entry_iov(e, 0, a, strlen(a));
+    if (b) entry_iov(e, 1, b, strlen(b));
+    put_result(e, ret, err);
+    entry_commit(e);
+}
+
+/* One-path mutations. Each is a drop-in for its syscall: same signature, same
+ * semantics, errno included -- so a call site changes by one identifier. */
+#define TAPE_FS_1(fn, OP, call)                          \
+    {                                                    \
+        if (rb_tape_replaying()) {                       \
+            return fs_mutate_replay(OP, path, NULL);     \
+        }                                                \
+        int ret = (call);                                \
+        int err = errno;                                 \
+        fs_mutate_record(OP, path, NULL, ret, err);      \
+        errno = err;                                     \
+        return ret;                                      \
+    }
+
+int rb_tape_mkdir(const char *path, mode_t mode) TAPE_FS_1(mkdir, RB_TAPE_FS_OP_MKDIR, mkdir(path, mode))
+int rb_tape_rmdir(const char *path)              TAPE_FS_1(rmdir, RB_TAPE_FS_OP_RMDIR, rmdir(path))
+int rb_tape_unlink(const char *path)             TAPE_FS_1(unlink, RB_TAPE_FS_OP_UNLINK, unlink(path))
+int rb_tape_chmod(const char *path, mode_t mode) TAPE_FS_1(chmod, RB_TAPE_FS_OP_CHMOD, chmod(path, mode))
+int rb_tape_truncate(const char *path, off_t len) TAPE_FS_1(truncate, RB_TAPE_FS_OP_TRUNCATE, truncate(path, len))
+
+int
+rb_tape_chown(const char *path, uid_t owner, gid_t group)
+    TAPE_FS_1(chown, RB_TAPE_FS_OP_CHOWN, chown(path, owner, group))
+
+int
+rb_tape_lchown(const char *path, uid_t owner, gid_t group)
+    TAPE_FS_1(lchown, RB_TAPE_FS_OP_LCHOWN, lchown(path, owner, group))
+
+int
+rb_tape_utimes(const char *path, const struct timeval *times)
+    TAPE_FS_1(utimes, RB_TAPE_FS_OP_UTIMES, utimes(path, times))
+
+#undef TAPE_FS_1
+
+/* Two-path mutations. */
+#define TAPE_FS_2(OP, call)                              \
+    {                                                    \
+        if (rb_tape_replaying()) {                       \
+            return fs_mutate_replay(OP, from, to);       \
+        }                                                \
+        int ret = (call);                                \
+        int err = errno;                                 \
+        fs_mutate_record(OP, from, to, ret, err);        \
+        errno = err;                                     \
+        return ret;                                      \
+    }
+
+int rb_tape_rename(const char *from, const char *to)  TAPE_FS_2(RB_TAPE_FS_OP_RENAME, rename(from, to))
+int rb_tape_link(const char *from, const char *to)    TAPE_FS_2(RB_TAPE_FS_OP_LINK, link(from, to))
+int rb_tape_symlink(const char *from, const char *to) TAPE_FS_2(RB_TAPE_FS_OP_SYMLINK, symlink(from, to))
+
+#undef TAPE_FS_2
+
+/* fd-based mutations. The fd is a *replayed* fd, so these must not reach the host
+ * either -- there is nothing real behind it. */
+int
+rb_tape_fchmod(int fd, mode_t mode)
+{
+    if (rb_tape_replaying()) return fs_mutate_replay(RB_TAPE_FS_OP_FCHMOD, NULL, NULL);
+    int ret = fchmod(fd, mode);
+    int err = errno;
+    fs_mutate_record(RB_TAPE_FS_OP_FCHMOD, NULL, NULL, ret, err);
+    errno = err;
+    return ret;
+}
+
+int
+rb_tape_ftruncate(int fd, off_t len)
+{
+    if (rb_tape_replaying()) return fs_mutate_replay(RB_TAPE_FS_OP_FTRUNCATE, NULL, NULL);
+    int ret = ftruncate(fd, len);
+    int err = errno;
+    fs_mutate_record(RB_TAPE_FS_OP_FTRUNCATE, NULL, NULL, ret, err);
+    errno = err;
+    return ret;
+}
 
 /*
  * The file position.

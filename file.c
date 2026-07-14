@@ -2817,7 +2817,7 @@ static void *
 nogvl_chmod(void *ptr)
 {
     struct nogvl_chmod_data *data = ptr;
-    int ret = chmod(data->path, data->mode);
+    int ret = rb_tape_chmod(data->path, data->mode);
     return (void *)(VALUE)ret;
 }
 
@@ -2834,7 +2834,7 @@ rb_chmod(const char *path, mode_t mode)
 static int
 chmod_internal(const char *path, void *mode)
 {
-    return chmod(path, *(mode_t *)mode);
+    return rb_tape_chmod(path, *(mode_t *)mode);
 }
 
 /*
@@ -2871,7 +2871,7 @@ static VALUE
 io_blocking_fchmod(void *ptr)
 {
     struct nogvl_fchmod_data *data = ptr;
-    int ret = fchmod(data->fd, data->mode);
+    int ret = rb_tape_fchmod(data->fd, data->mode);
     return (VALUE)ret;
 }
 
@@ -3002,7 +3002,7 @@ static int
 chown_internal(const char *path, void *arg)
 {
     struct chown_args *args = arg;
-    return chown(path, args->owner, args->group);
+    return rb_tape_chown(path, args->owner, args->group);
 }
 
 /*
@@ -3044,7 +3044,7 @@ static void *
 nogvl_chown(void *ptr)
 {
     struct nogvl_chown_data *data = ptr;
-    return (void *)(VALUE)chown(data->as.path, data->new.owner, data->new.group);
+    return (void *)(VALUE)rb_tape_chown(data->as.path, data->new.owner, data->new.group);
 }
 
 static int
@@ -3123,7 +3123,7 @@ static int
 lchown_internal(const char *path, void *arg)
 {
     struct chown_args *args = arg;
-    return lchown(path, args->owner, args->group);
+    return rb_tape_lchown(path, args->owner, args->group);
 }
 
 /*
@@ -3315,7 +3315,7 @@ utime_internal(const char *path, void *arg)
 #ifdef HAVE_LUTIMES
     if (v->follow) return lutimes(path, tvp);
 #endif
-    return utimes(path, tvp);
+    return rb_tape_utimes(path, tvp);
 }
 
 #else /* !defined(HAVE_UTIMES) */
@@ -3513,7 +3513,7 @@ rb_file_s_link(VALUE klass, VALUE from, VALUE to)
     from = rb_str_encode_ospath(from);
     to = rb_str_encode_ospath(to);
 
-    if (link(StringValueCStr(from), StringValueCStr(to)) < 0) {
+    if (rb_tape_link(StringValueCStr(from), StringValueCStr(to)) < 0) {
         sys_fail2(from, to);
     }
     return INT2FIX(0);
@@ -3555,7 +3555,7 @@ rb_file_s_symlink(VALUE klass, VALUE from, VALUE to)
     from = rb_str_encode_ospath(from);
     to = rb_str_encode_ospath(to);
 
-    if (symlink(StringValueCStr(from), StringValueCStr(to)) < 0) {
+    if (rb_tape_symlink(StringValueCStr(from), StringValueCStr(to)) < 0) {
         sys_fail2(from, to);
     }
     return INT2FIX(0);
@@ -3652,7 +3652,7 @@ rb_readlink(VALUE path, rb_encoding *enc)
 static int
 unlink_internal(const char *path, void *arg)
 {
-    return unlink(path);
+    return rb_tape_unlink(path);
 }
 
 /*
@@ -3687,7 +3687,7 @@ no_gvl_rename(void *ptr)
 {
     struct rename_args *ra = ptr;
 
-    return (void *)(VALUE)rename(ra->src, ra->dst);
+    return (void *)(VALUE)rb_tape_rename(ra->src, ra->dst);
 }
 
 /*
@@ -3720,9 +3720,9 @@ rb_file_s_rename(VALUE klass, VALUE from, VALUE to)
 #if defined DOSISH
         switch (e) {
           case EEXIST:
-            if (chmod(ra.dst, 0666) == 0 &&
-                unlink(ra.dst) == 0 &&
-                rename(ra.src, ra.dst) == 0)
+            if (rb_tape_chmod(ra.dst, 0666) == 0 &&
+                rb_tape_unlink(ra.dst) == 0 &&
+                rb_tape_rename(ra.src, ra.dst) == 0)
                 return INT2FIX(0);
         }
 #endif
@@ -5820,7 +5820,7 @@ static void *
 nogvl_truncate(void *ptr)
 {
     struct truncate_arg *ta = ptr;
-    return (void *)(VALUE)truncate(ta->path, ta->pos);
+    return (void *)(VALUE)rb_tape_truncate(ta->path, ta->pos);
 }
 
 /*
@@ -5869,7 +5869,7 @@ nogvl_ftruncate(void *ptr)
 {
     struct ftruncate_arg *fa = ptr;
 
-    return (VALUE)ftruncate(fa->fd, fa->pos);
+    return (VALUE)rb_tape_ftruncate(fa->fd, fa->pos);
 }
 
 /*

@@ -1747,7 +1747,7 @@ nogvl_mkdir(void *ptr)
 {
     struct mkdir_arg *m = ptr;
 
-    return (void *)(VALUE)mkdir(m->path, m->mode);
+    return (void *)(VALUE)rb_tape_mkdir(m->path, m->mode);
 }
 
 /*
@@ -1795,7 +1795,7 @@ nogvl_rmdir(void *ptr)
 {
     const char *path = ptr;
 
-    return (void *)(VALUE)rmdir(path);
+    return (void *)(VALUE)rb_tape_rmdir(path);
 }
 
 /*

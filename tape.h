@@ -63,7 +63,43 @@ enum rb_tape_effect {
      * ordinary output (`$$`, the test runner's own banner) and into temp-file
      * names, so an unrecorded pid diverges on the *bytes* and on the *paths*. */
     RB_TAPE_PROC_GETPID     = 18,
+    /* Every filesystem *mutation* -- mkdir, unlink, rename, chmod, ... They share
+     * one func_index and carry the op as data, because from the tape's point of
+     * view they are all the same shape: (op, one or two paths) -> (result, errno).
+     * And replay does the same thing with every one of them: serve the recorded
+     * result and touch nothing. See rb_tape_fs_op. */
+    RB_TAPE_FS_MUTATE       = 19,
     RB_TAPE_EFFECT_MAX
+};
+
+/**
+ * The filesystem mutations, as an op code on RB_TAPE_FS_MUTATE. Append only.
+ *
+ * These were the last effects still executing for real during replay, and they
+ * made "replay is hermetic" false in the most dangerous way available: quietly.
+ * A replayed run reported `no divergence` while creating a directory on the real
+ * disk -- it half-executed, running the mkdir and suppressing the write inside it.
+ *
+ * And the leak was not even the worst of it. A program that *cleans up after
+ * itself* could not be replayed at all: the recording run deleted its temp file,
+ * so the replay run's unlink hit ENOENT and raised. Writing a temp file and
+ * removing it is what most of a test suite does.
+ */
+enum rb_tape_fs_op {
+    RB_TAPE_FS_OP_MKDIR     = 0,
+    RB_TAPE_FS_OP_RMDIR     = 1,
+    RB_TAPE_FS_OP_UNLINK    = 2,
+    RB_TAPE_FS_OP_RENAME    = 3,
+    RB_TAPE_FS_OP_CHMOD     = 4,
+    RB_TAPE_FS_OP_FCHMOD    = 5,
+    RB_TAPE_FS_OP_CHOWN     = 6,
+    RB_TAPE_FS_OP_LCHOWN    = 7,
+    RB_TAPE_FS_OP_SYMLINK   = 8,
+    RB_TAPE_FS_OP_LINK      = 9,
+    RB_TAPE_FS_OP_TRUNCATE  = 10,
+    RB_TAPE_FS_OP_FTRUNCATE = 11,
+    RB_TAPE_FS_OP_UTIMES    = 12,
+    RB_TAPE_FS_OP_MAX
 };
 
 /** Outcome tag for a recorded entry. Mirrors Watt's `Action`. */
@@ -110,6 +146,19 @@ int rb_tape_replaying(void);
  */
 void rb_tape_pause(void);
 void rb_tape_unpause(void);
+
+/**
+ * Declare the calling thread to be VM infrastructure, not the program. Nothing it
+ * does will ever reach the tape.
+ *
+ * Called once by the timer thread. It wakes on a wall-clock schedule -- every few
+ * milliseconds, whether or not the program did anything -- and reads the monotonic
+ * clock to decide which sleeping thread is due. Those reads are not the program
+ * asking for the time; they never flow back into it. Taping them sprayed entries
+ * across the effect stream at points that depended on nothing but how long the
+ * last syscall happened to take.
+ */
+void rb_tape_thread_off(void);
 
 /**
  * True if a tape is active at all. The chokepoints test this first so an
@@ -209,6 +258,25 @@ int rb_tape_fstat(int fd, struct stat *st);
 int rb_tape_stat(const char *path, struct stat *st);
 int rb_tape_lstat(const char *path, struct stat *st);
 off_t rb_tape_lseek(int fd, off_t offset, int whence);
+
+/* The filesystem mutations. Drop-ins, like the rest: same signature, same
+ * semantics, errno included. On replay they touch nothing and serve the recorded
+ * result -- so the mkdir does not happen, and the stat that observes it afterwards
+ * comes off the tape saying the directory is there. */
+#include <sys/time.h>
+int rb_tape_mkdir(const char *path, mode_t mode);
+int rb_tape_rmdir(const char *path);
+int rb_tape_unlink(const char *path);
+int rb_tape_rename(const char *from, const char *to);
+int rb_tape_chmod(const char *path, mode_t mode);
+int rb_tape_fchmod(int fd, mode_t mode);
+int rb_tape_chown(const char *path, uid_t owner, gid_t group);
+int rb_tape_lchown(const char *path, uid_t owner, gid_t group);
+int rb_tape_symlink(const char *from, const char *to);
+int rb_tape_link(const char *from, const char *to);
+int rb_tape_truncate(const char *path, off_t len);
+int rb_tape_ftruncate(int fd, off_t len);
+int rb_tape_utimes(const char *path, const struct timeval *times);
 
 /**
  * `open` is the exception to the drop-in shape. `rb_cloexec_open` runs fcntl

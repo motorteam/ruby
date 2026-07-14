@@ -1,3 +1,4 @@
+#include "tape.h"
 /* -*-c-*- */
 /**********************************************************************
 
@@ -3207,6 +3208,14 @@ timer_thread_func(void *ptr)
 #if defined(RUBY_NT_SERIAL)
     ruby_nt_serial = (rb_atomic_t)-1;
 #endif
+
+    /* Nothing this thread does belongs on the tape. It wakes on a wall clock, not
+     * because the program asked for anything, and the monotonic clock it reads
+     * below (timer_thread_check_timeout) never flows back into the program -- it
+     * only decides which sleeper is due. Taped, those reads landed in the middle of
+     * the program's effect stream at points that depended on nothing but how long
+     * the last syscall took. See rb_tape_thread_off. */
+    rb_tape_thread_off();
 
     RUBY_DEBUG_LOG("started%s", "");
 

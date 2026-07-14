@@ -105,6 +105,7 @@ char *strchr(char*,char);
 #include "encindex.h"
 #include "id.h"
 #include "internal.h"
+#include "tape.h"
 #include "internal/array.h"
 #include "internal/dir.h"
 #include "internal/encoding.h"
@@ -530,7 +531,7 @@ dir_free(void *ptr)
 {
     struct dir_data *dir = ptr;
 
-    if (dir->dir) closedir(dir->dir);
+    if (dir->dir) rb_tape_closedir(dir->dir);
 }
 
 RUBY_REFERENCES(dir_refs) = {
@@ -589,7 +590,7 @@ static void
 close_dir_data(struct dir_data *dp)
 {
     if (dp->dir) {
-        if (closedir(dp->dir) < 0) {
+        if (rb_tape_closedir(dp->dir) < 0) {
             dp->dir = NULL;
             rb_sys_fail("closedir");
         }
@@ -600,7 +601,7 @@ close_dir_data(struct dir_data *dp)
 static void
 check_closedir(DIR *dirp)
 {
-    if (closedir(dirp) < 0)
+    if (rb_tape_closedir(dirp) < 0)
         rb_sys_fail("closedir");
 }
 
@@ -622,11 +623,11 @@ dir_initialize(rb_execution_context_t *ec, VALUE dir, VALUE dirname, VALUE enc)
     RB_OBJ_WRITE(dir, &dp->path, Qnil);
     dp->enc = fsenc;
     path = RSTRING_PTR(dirname);
-    dp->dir = opendir_without_gvl(path);
+    dp->dir = RB_TAPE_ACTIVE() ? rb_tape_opendir(path) : opendir_without_gvl(path);
     if (dp->dir == NULL) {
         int e = errno;
         if (rb_gc_for_fd(e)) {
-            dp->dir = opendir_without_gvl(path);
+            dp->dir = RB_TAPE_ACTIVE() ? rb_tape_opendir(path) : opendir_without_gvl(path);
         }
 #ifdef HAVE_GETATTRLIST
         else if (e == EIO) {
@@ -634,7 +635,7 @@ dir_initialize(rb_execution_context_t *ec, VALUE dir, VALUE dirname, VALUE enc)
             struct attrlist al = {ATTR_BIT_MAP_COUNT, 0};
             struct getattrlist_args args = GETATTRLIST_ARGS(&al, attrbuf, FSOPT_NOFOLLOW);
             if (gvl_getattrlist(&args, path) == 0) {
-                dp->dir = opendir_without_gvl(path);
+                dp->dir = RB_TAPE_ACTIVE() ? rb_tape_opendir(path) : opendir_without_gvl(path);
             }
         }
 #endif
@@ -860,7 +861,18 @@ nogvl_readdir(void *dir)
     return dir;
 }
 
-# define READDIR(dir, enc) IO_WITHOUT_GVL(nogvl_readdir, (void *)(dir))
+static void *
+tape_readdir(void *dir)
+{
+    /* The recorder allocates, so it needs the GVL: under a tape, read the entry
+     * inline rather than through IO_WITHOUT_GVL. An untaped run is untouched. */
+    if (RB_TAPE_ACTIVE()) {
+        return rb_tape_readdir((DIR *)dir);
+    }
+    return IO_WITHOUT_GVL(nogvl_readdir, dir);
+}
+
+# define READDIR(dir, enc) tape_readdir((void *)(dir))
 # define READDIR_NOGVL(dir, enc) nogvl_readdir((dir))
 #endif
 

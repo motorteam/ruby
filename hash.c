@@ -26,6 +26,7 @@
 #include "debug_counter.h"
 #include "id.h"
 #include "internal.h"
+#include "tape.h"
 #include "internal/array.h"
 #include "internal/bignum.h"
 #include "internal/basic_operators.h"
@@ -5226,7 +5227,7 @@ getenv_with_lock(const char *name)
     VALUE ret;
     rb_encoding *enc = env_encoding();
     ENV_LOCKING() {
-        const char *val = getenv(name);
+        const char *val = rb_tape_getenv(name);
         ret = env_str_new2(val, enc);
     }
     return ret;

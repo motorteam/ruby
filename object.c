@@ -22,6 +22,7 @@
 #include "constant.h"
 #include "id.h"
 #include "internal.h"
+#include "tape.h"
 #include "internal/array.h"
 #include "internal/class.h"
 #include "internal/error.h"
@@ -718,7 +719,13 @@ rb_any_to_s(VALUE obj)
     VALUE str;
     VALUE cname = rb_class_name(CLASS_OF(obj));
 
-    str = rb_sprintf("#<%"PRIsVALUE":%p>", cname, (void*)obj);
+    /* The address is pure nondeterminism, and `inspect` delegates here -- so
+     * `puts obj` on any plain object would diverge on replay. Under a tape,
+     * print a deterministic stand-in. */
+    const void *addr = RB_TAPE_ACTIVE()
+                     ? (const void *)rb_tape_canonical_addr((void *)obj)
+                     : (const void *)obj;
+    str = rb_sprintf("#<%"PRIsVALUE":%p>", cname, addr);
 
     return str;
 }

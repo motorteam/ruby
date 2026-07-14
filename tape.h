@@ -46,6 +46,14 @@ enum rb_tape_effect {
      * (io.c:8619), so an unrecorded isatty silently ties a tape to whether it
      * was recorded under a terminal or a pipe. */
     RB_TAPE_FS_ISATTY       = 12,
+    /* 13 is fs.lseek in the Python port; Ruby does not hook it yet. */
+    RB_TAPE_FS_OPENDIR      = 14,
+    RB_TAPE_FS_READDIR      = 15,
+    RB_TAPE_FS_CLOSEDIR     = 16,
+    /* Ruby reads ENV per name (getenv_with_lock, hash.c), where CPython
+     * snapshots it into a dict at startup -- so this is a per-read effect rather
+     * than the one-shot snapshot the Python port records. */
+    RB_TAPE_ENV_GET         = 17,
     RB_TAPE_EFFECT_MAX
 };
 
@@ -126,6 +134,45 @@ int rb_tape_lstat(const char *path, struct stat *st);
  */
 int  rb_tape_replay_open(const char *path);
 void rb_tape_record_open(const char *path, int flags, int fd, int err);
+
+/*
+ * A deterministic stand-in for an object's address.
+ *
+ * `rb_any_to_s` (object.c:721) formats `#<Foo:%p>` -- the raw heap address --
+ * and `inspect` delegates to it. So `puts obj` on any plain object leaks ASLR
+ * and allocation history straight into ordinary program output, and every such
+ * program diverges on replay.
+ *
+ * (object_id is fine: since 3.5 it is a monotonic counter, not an address.)
+ *
+ * Under a tape, hand out a sequential stand-in instead: the first address asked
+ * about gets one, the second another, and the same address always gets the same
+ * one. Allocation order is deterministic given a deterministic effect stream, so
+ * the order these are *requested* in is deterministic too, and replay reproduces
+ * them exactly. Values are spaced like real addresses so a to_s still reads like
+ * a to_s.
+ */
+uintptr_t rb_tape_canonical_addr(const void *ptr);
+
+/*
+ * Directory iteration.
+ *
+ * readdir returns entries in raw filesystem order -- no sort -- so it is
+ * nondeterministic across machines and across any change to the directory. And
+ * without it on the tape, a program that lists a directory cannot be replayed
+ * once the directory is gone.
+ *
+ * On replay rb_tape_opendir hands back a real DIR* on "/", so closedir stays
+ * valid -- the same trick as rb_tape_replay_open handing back a real fd. The real
+ * handle is never read; every entry comes off the tape.
+ */
+#include <dirent.h>
+DIR *rb_tape_opendir(const char *path);
+struct dirent *rb_tape_readdir(DIR *dirp);
+int rb_tape_closedir(DIR *dirp);
+
+/** ENV. Returns the recorded value on replay; NULL for an unset variable. */
+const char *rb_tape_getenv(const char *name);
 
 /**
  * Make the std streams' TTY-ness match the tape. Defined in io.c (it needs

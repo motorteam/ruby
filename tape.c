@@ -63,6 +63,11 @@ static const char *const tape_effect_fqn[] = {
     "fs.lstat",
     "fs.fstat",
     "fs.isatty",
+    "(13: unused)",
+    "fs.opendir",
+    "fs.readdir",
+    "fs.closedir",
+    "env.get",
 };
 
 /* Effect signatures, for the Signature column of `--tape-inspect`. Ruby is
@@ -83,6 +88,11 @@ static const char *const tape_effect_sig[] = {
     "([[byte]], [[byte]]) -> int", /* fs.lstat */
     "(int, [[byte]]) -> int",   /* fs.fstat  -- scatter: struct stat */
     "(int) -> bool",            /* fs.isatty */
+    "",                         /* 13 -- unused in the Ruby port */
+    "([[byte]]) -> int",        /* fs.opendir -- gather: the path */
+    "() -> [[byte]]",           /* fs.readdir -- scatter: the entry name */
+    "() -> int",                /* fs.closedir */
+    "([[byte]]) -> [[byte]]",   /* env.get -- gather: name; scatter: value */
 };
 
 /* ── Growable byte buffer ─────────────────────────────────────────────────── */
@@ -719,6 +729,213 @@ int rb_tape_stat(const char *path, struct stat *st)  { return tape_stat(RB_TAPE_
 int rb_tape_lstat(const char *path, struct stat *st) { return tape_stat(RB_TAPE_FS_LSTAT, path, -1, st, call_lstat); }
 int rb_tape_fstat(int fd, struct stat *st)           { return tape_stat(RB_TAPE_FS_FSTAT, NULL, fd, st, call_fstat); }
 
+/* ── Effect: directory iteration ──────────────────────────────────────────── */
+
+#include <dirent.h>
+
+DIR *
+rb_tape_opendir(const char *path)
+{
+    if (rb_tape_replaying()) {
+        const tape_entry *e = tape_next(RB_TAPE_FS_OPENDIR);
+        check_path_diverged(e, path);
+        if (take_result(e) != 0) {
+            return NULL;   /* the recorded opendir failed; errno is restored */
+        }
+        /* A real handle, so closedir() stays valid. Never actually read. */
+        DIR *real = opendir("/");
+        if (real == NULL) {
+            tape_diverged("replay could not open \"/\": %s", strerror(errno));
+        }
+        return real;
+    }
+
+    DIR *dirp = opendir(path);
+    int err = errno;
+
+    if (rb_tape_recording()) {
+        tape_entry *e = entry_begin(RB_TAPE_FS_OPENDIR);
+        if (e) {
+            entry_iov(e, 0, path, strlen(path));
+            put_result(e, dirp == NULL ? -1 : 0, err);
+            entry_commit(e);
+        }
+    }
+    errno = err;
+    return dirp;
+}
+
+struct dirent *
+rb_tape_readdir(DIR *dirp)
+{
+    /* readdir's contract is that it returns storage it owns and the caller copies
+     * d_name at once -- so a static is exactly right here. */
+    static struct dirent slot;
+
+    if (rb_tape_replaying()) {
+        const tape_entry *e = tape_next(RB_TAPE_FS_READDIR);
+        if (take_result(e) != 0) {
+            return NULL;   /* end of directory, or a recorded error */
+        }
+        const tape_iov *iov = entry_find_iov(e, 0);
+        memset(&slot, 0, sizeof(slot));
+        if (iov) {
+            size_t n = iov->bytes.len;
+            if (n >= sizeof(slot.d_name)) {
+                n = sizeof(slot.d_name) - 1;
+            }
+            memcpy(slot.d_name, iov->bytes.ptr, n);
+            slot.d_name[n] = '\0';
+        }
+        if (e->args.len >= 4) {
+            slot.d_type = (unsigned char)get_u32(e->args.ptr);
+        }
+        return &slot;
+    }
+
+    errno = 0;
+    struct dirent *ep = readdir(dirp);
+    int err = errno;
+
+    if (rb_tape_recording()) {
+        tape_entry *e = entry_begin(RB_TAPE_FS_READDIR);
+        if (e) {
+            put_u32(&e->args, ep ? (uint32_t)ep->d_type : 0);
+            if (ep) {
+                entry_iov(e, 0, ep->d_name, strlen(ep->d_name));
+            }
+            put_result(e, ep == NULL ? -1 : 0, err);
+            entry_commit(e);
+        }
+    }
+    errno = err;
+    return ep;
+}
+
+int
+rb_tape_closedir(DIR *dirp)
+{
+    if (rb_tape_replaying()) {
+        closedir(dirp);   /* the "/" handle we handed out; the result is taped */
+        return (int)take_result(tape_next(RB_TAPE_FS_CLOSEDIR));
+    }
+
+    int ret = closedir(dirp);
+    int err = errno;
+
+    if (rb_tape_recording()) {
+        tape_entry *e = entry_begin(RB_TAPE_FS_CLOSEDIR);
+        if (e) {
+            put_result(e, ret, err);
+            entry_commit(e);
+        }
+    }
+    errno = err;
+    return ret;
+}
+
+/* ── Effect: the environment ──────────────────────────────────────────────── */
+
+const char *
+rb_tape_getenv(const char *name)
+{
+    if (rb_tape_replaying()) {
+        const tape_entry *e = tape_next(RB_TAPE_ENV_GET);
+        check_path_diverged(e, name);   /* reading a *different* variable is a divergence */
+        if (take_result(e) != 0) {
+            return NULL;   /* the variable was unset when recorded */
+        }
+        const tape_iov *iov = entry_find_iov(e, 1);
+        return iov ? (const char *)iov->bytes.ptr : NULL;
+    }
+
+    const char *val = getenv(name);
+
+    if (rb_tape_recording()) {
+        tape_entry *e = entry_begin(RB_TAPE_ENV_GET);
+        if (e) {
+            entry_iov(e, 0, name, strlen(name));
+            if (val) {
+                /* The trailing NUL goes on the tape too, so the replayed pointer
+                 * is a valid C string straight out of the iov buffer. */
+                entry_iov(e, 1, val, strlen(val) + 1);
+            }
+            put_result(e, val ? 0 : -1, 0);
+            entry_commit(e);
+        }
+    }
+    return val;
+}
+
+/* ── Canonical addresses ──────────────────────────────────────────────────── */
+
+/* Open-addressed pointer -> stand-in map. Only objects whose address is actually
+ * observed (a default to_s or inspect) ever land here, so it stays small. */
+typedef struct {
+    uintptr_t key;      /* 0 = empty */
+    uintptr_t value;
+} addr_slot;
+
+static struct {
+    addr_slot *slots;
+    size_t cap;         /* always a power of two */
+    size_t len;
+    size_t next;        /* the next stand-in to hand out */
+} addrs;
+
+#define TAPE_ADDR_BASE 0x7f0000000000ULL   /* looks like a real heap address */
+#define TAPE_ADDR_STEP 16                  /* Ruby objects are 16-byte aligned */
+
+static void
+addrs_grow(void)
+{
+    size_t cap = addrs.cap ? addrs.cap * 2 : 1024;
+    addr_slot *slots = xcalloc(cap, sizeof(addr_slot));
+    for (size_t i = 0; i < addrs.cap; i++) {
+        if (addrs.slots[i].key == 0) {
+            continue;
+        }
+        size_t j = (size_t)(addrs.slots[i].key >> 4) & (cap - 1);
+        while (slots[j].key != 0) {
+            j = (j + 1) & (cap - 1);
+        }
+        slots[j] = addrs.slots[i];
+    }
+    xfree(addrs.slots);
+    addrs.slots = slots;
+    addrs.cap = cap;
+}
+
+uintptr_t
+rb_tape_canonical_addr(const void *ptr)
+{
+    uintptr_t key = (uintptr_t)ptr;
+    if (key == 0) {
+        return 0;
+    }
+    if (addrs.len * 2 >= addrs.cap) {
+        addrs_grow();
+    }
+
+    size_t i = (size_t)(key >> 4) & (addrs.cap - 1);
+    while (addrs.slots[i].key != 0) {
+        if (addrs.slots[i].key == key) {
+            return addrs.slots[i].value;
+        }
+        i = (i + 1) & (addrs.cap - 1);
+    }
+
+    /* First sighting. We never evict: if Ruby reuses a freed address, the new
+     * object gets the old stand-in -- which is what Ruby itself does with real
+     * addresses, so the semantics match. */
+    uintptr_t value = (uintptr_t)(TAPE_ADDR_BASE + addrs.next * TAPE_ADDR_STEP);
+    addrs.next++;
+    addrs.slots[i].key = key;
+    addrs.slots[i].value = value;
+    addrs.len++;
+    return value;
+}
+
 /* ── Encode ───────────────────────────────────────────────────────────────── */
 
 static int64_t
@@ -979,7 +1196,9 @@ path_effect_p(int func_index)
 {
     return func_index == RB_TAPE_FS_OPEN
         || func_index == RB_TAPE_FS_STAT
-        || func_index == RB_TAPE_FS_LSTAT;
+        || func_index == RB_TAPE_FS_LSTAT
+        || func_index == RB_TAPE_FS_OPENDIR
+        || func_index == RB_TAPE_ENV_GET;
 }
 
 /** The Args cell: the entry's scalar arguments, comma-joined, as Watt shows them. */
@@ -995,6 +1214,11 @@ render_args(tape_buf *out, const tape_entry *e)
         }
         break;
       case RB_TAPE_RANDOM_BYTES:
+      case RB_TAPE_FS_READDIR: {
+        const tape_iov *nm = entry_find_iov(e, 0);
+        if (nm) render_payload(out, nm->bytes.ptr, nm->bytes.len);
+        break;
+      }
       case RB_TAPE_FS_CLOSE:
       case RB_TAPE_FS_FSTAT:
       case RB_TAPE_FS_ISATTY:

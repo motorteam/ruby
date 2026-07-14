@@ -1807,6 +1807,26 @@ rb_memhash(const void *ptr, long len)
 void
 Init_RandomSeedCore(void)
 {
+    /* Under a tape the salt is *pinned*, not drawn from entropy.
+     *
+     * It cannot be recorded: this runs before the command line is parsed and long
+     * before the tape is armed. And it cannot be recorded-and-restored later
+     * either, because every st_table built during startup was hashed with whatever
+     * salt was live at the time, and re-seeding afterwards would leave all of them
+     * unsearchable. So both runs are given the same constant salt instead, and
+     * `"x".hash` finally agrees between record and replay. An untaped run is
+     * untouched. */
+    if (rb_tape_pinned_seed_p()) {
+        struct MT mt;
+        uint32_t seed[DEFAULT_SEED_CNT];
+        for (int i = 0; i < DEFAULT_SEED_CNT; ++i) {
+            seed[i] = 0x9e3779b9u * (uint32_t)(i + 1);
+        }
+        init_by_array(&mt, seed, DEFAULT_SEED_CNT);
+        init_hash_salt(&mt);
+        return;
+    }
+
     if (!fill_random_bytes(&hash_salt, sizeof(hash_salt), FALSE)) return;
 
     /*

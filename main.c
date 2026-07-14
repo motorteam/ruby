@@ -19,6 +19,7 @@
  */
 #undef RUBY_EXPORT
 #include "ruby.h"
+#include "tape.h"
 #include "vm_debug.h"
 #include "internal/sanitizers.h"
 #ifdef HAVE_LOCALE_H
@@ -38,6 +39,13 @@ static int
 rb_main(int argc, char **argv)
 {
     RUBY_INIT_STACK;
+    /* Before ruby_init(), because the hash salt is drawn inside it -- in
+     * Init_RandomSeedCore, before the command line is parsed and long before the
+     * tape is armed. An unpinned salt makes `"x".hash` differ between record and
+     * replay, and it cannot be re-seeded after the fact without corrupting every
+     * st_table built during startup. So a taped run has to be recognized here, and
+     * this peek at argv is the whole of what that takes. See tape.h. */
+    rb_tape_scan_argv(argc, argv);
     ruby_init();
     return ruby_run_node(ruby_options(argc, argv));
 }

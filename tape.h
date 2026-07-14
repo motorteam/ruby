@@ -161,6 +161,22 @@ void rb_tape_unpause(void);
 void rb_tape_thread_off(void);
 
 /**
+ * Peek at argv for a tape flag, before ruby_init(). Called from main.c.
+ *
+ * Everything else here can wait until the tape is armed. The hash salt cannot: it
+ * is drawn in Init_RandomSeedCore, inside ruby_init(), before the command line is
+ * parsed -- so it never reached the tape, and `"x".hash` differed between record
+ * and replay. Nor can it be recorded and restored afterwards, because every
+ * st_table built during startup was hashed with the live salt and re-seeding would
+ * leave them all unsearchable. It has to be pinned *before* startup, which means
+ * knowing this early that a tape is coming.
+ */
+void rb_tape_scan_argv(int argc, char **argv);
+
+/** True if the hash salt should be pinned rather than drawn from entropy. */
+int rb_tape_pinned_seed_p(void);
+
+/**
  * True if a tape is active at all. The chokepoints test this first so an
  * untaped run pays a single predictable branch and nothing else.
  */

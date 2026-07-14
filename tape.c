@@ -343,6 +343,44 @@ int rb_tape_replaying(void) { return tape.replaying && !tape.paused && !tape_on_
 void rb_tape_pause(void)   { tape.paused++; }
 void rb_tape_unpause(void) { if (tape.paused > 0) tape.paused--; }
 
+/*
+ * Whether this process was started with a tape flag -- answered *before*
+ * ruby_init(), which is earlier than anything else here can be answered.
+ *
+ * The hash salt is the reason. It is drawn in Init_RandomSeedCore (random.c),
+ * which the comment there describes as running "at very early stage of Ruby
+ * startup" -- inside ruby_init(), long before the command line is parsed and the
+ * tape is armed. So the salt never reached the tape, and `"x".hash` came out
+ * different on every run: record and replay disagreed on the hash of every String
+ * and every Symbol.
+ *
+ * It cannot be fixed by recording the salt and restoring it later. Every st_table
+ * built during startup was hashed with the salt that was live at the time, and
+ * re-seeding afterwards would leave all of them unsearchable. The salt has to be
+ * *pinned before startup* rather than recorded during it -- and the only thing that
+ * requires is knowing, that early, that this is a taped run. Hence a peek at argv,
+ * which is the whole of what this does.
+ */
+static int tape_flag_seen;
+
+void
+rb_tape_scan_argv(int argc, char **argv)
+{
+    static const char *const flags[] = {
+        "--tape-record", "--tape-replay", "--tape-view", "--tape-inspect",
+    };
+    for (int i = 1; i < argc; i++) {
+        for (size_t f = 0; f < sizeof(flags) / sizeof(flags[0]); f++) {
+            if (strncmp(argv[i], flags[f], strlen(flags[f])) == 0) {
+                tape_flag_seen = 1;
+                return;
+            }
+        }
+    }
+}
+
+int rb_tape_pinned_seed_p(void) { return tape_flag_seen; }
+
 /* Caller holds tape_lock. rb_warn is not an option here: it allocates a Ruby
  * String, and we may have no GVL. */
 static void

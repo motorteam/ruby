@@ -82,6 +82,7 @@ static const char *const tape_effect_fqn[] = {
     "proc.waitpid",
     "fs.pipe",
     "fs.fcntl",
+    "io.select",
 };
 
 /* Effect signatures, for the Signature column of `--tape-inspect`. Ruby is
@@ -118,6 +119,7 @@ static const char *const tape_effect_sig[] = {
     "() -> (int, int)",         /* proc.waitpid -> (pid, status) */
     "() -> (int, int)",         /* fs.pipe      -> (read fd, write fd) */
     "(int, int) -> int",        /* fs.fcntl     -- (fd, cmd) -> flags */
+    "([[int]], [[int]], [[int]]) -> int",  /* io.select -- scatter: the ready fds */
 };
 
 /* ── Allocation ───────────────────────────────────────────────────────────────
@@ -1791,6 +1793,55 @@ rb_tape_getpid(void)
         }
     }
     return pid;
+}
+
+/* ── Effect: readiness ────────────────────────────────────────────────────────
+ *
+ * This is the effect the fiber scheduler is *made of*. test/fiber/scheduler.rb is a
+ * loop around IO.select, and which descriptors come back ready is what decides which
+ * fiber resumes next. Untaped, a replayed scheduler selected on descriptors that were
+ * never opened, got an answer the recording never saw, and resumed its fibers in a
+ * different order -- so their effects arrived in a different order, and the tape said
+ * the thread read where it should have closed.
+ *
+ * What goes on the tape is the *verdict*, not the polling: which fds came back ready,
+ * which is the only part the program can see. The three sets are scatter args; on
+ * replay they are rewritten to name exactly those descriptors, and nothing is polled.
+ */
+void
+rb_tape_record_select(int ret, int err,
+                      const int *rfds, int rn, const int *wfds, int wn,
+                      const int *efds, int en)
+{
+    if (!rb_tape_recording()) return;
+    tape_entry *e = entry_begin(RB_TAPE_IO_SELECT);
+    if (!e) return;
+    entry_iov(e, 0, rfds, (size_t)rn * sizeof(int));
+    entry_iov(e, 1, wfds, (size_t)wn * sizeof(int));
+    entry_iov(e, 2, efds, (size_t)en * sizeof(int));
+    put_result(e, ret, err);
+    entry_commit(e);
+}
+
+static int
+take_fds(const tape_entry *e, uint8_t arg_index, int *out, int *n)
+{
+    const tape_iov *iov = entry_find_iov(e, arg_index);
+    *n = 0;
+    if (!iov) return 0;
+    *n = (int)(iov->bytes.len / sizeof(int));
+    memcpy(out, iov->bytes.ptr, iov->bytes.len);
+    return *n;
+}
+
+int
+rb_tape_replay_select(int *rfds, int *rn, int *wfds, int *wn, int *efds, int *en)
+{
+    const tape_entry *e = tape_next(RB_TAPE_IO_SELECT);
+    take_fds(e, 0, rfds, rn);
+    take_fds(e, 1, wfds, wn);
+    take_fds(e, 2, efds, en);
+    return take_result(e);
 }
 
 /* ── Effect: subprocesses ─────────────────────────────────────────────────────

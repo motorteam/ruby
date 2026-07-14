@@ -139,6 +139,20 @@ enum rb_tape_effect {
      * is the same trap rb_cloexec_open already sidesteps by returning before its own
      * fixups; IO.new asks on the program's behalf, so it has to be answered instead. */
     RB_TAPE_FS_FCNTL        = 28,
+    /**
+     * Readiness -- `IO.select`, and everything that waits on it.
+     *
+     * This is the effect the fiber scheduler is *made of*. `test/fiber/scheduler.rb`
+     * is a loop around `IO.select`, and which descriptors it names on the way out is
+     * what decides which fiber resumes next. Untaped, a replayed scheduler selects on
+     * descriptors that were never opened, gets an answer the recording never saw, and
+     * resumes its fibers in a different order -- so their effects arrive in a different
+     * order, and the tape says the thread read where it should have closed.
+     *
+     * The readiness verdict, not the polling: what goes on the tape is *which fds came
+     * back ready*, which is the only thing the program can see.
+     */
+    RB_TAPE_IO_SELECT       = 29,
     RB_TAPE_EFFECT_MAX
 };
 
@@ -452,6 +466,19 @@ int rb_tape_pipe(int descriptors[2], int (*call)(int[2]));
 
 /** fcntl(fd, cmd) -- the one-argument commands, F_GETFL and friends. */
 int rb_tape_fcntl(int fd, int cmd);
+
+/**
+ * Readiness. The three sets are *scatter* args: on replay they are rewritten to name
+ * exactly the descriptors the recording found ready, and nothing is polled.
+ *
+ * The fds are passed as plain arrays rather than fd_sets so this header stays free of
+ * CRuby's rb_fdset_t -- the caller in thread.c does the marshalling, which is a dozen
+ * lines and keeps the platform's fd_set representation out of the wire format.
+ */
+int rb_tape_replay_select(int *rfds, int *rn, int *wfds, int *wn, int *efds, int *en);
+void rb_tape_record_select(int ret, int err,
+                           const int *rfds, int rn, const int *wfds, int wn,
+                           const int *efds, int en);
 
 /**
  * Stop recording, permanently, on this process.

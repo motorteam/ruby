@@ -4665,11 +4665,53 @@ do_select(VALUE p)
     return (VALUE)result;
 }
 
+/* fd_set <-> plain int array. The tape stores the *fds that came back ready*, not the
+ * platform's bitmask -- a bitmask would put fd_set's layout in the wire format for no
+ * benefit, and the readiness verdict is the only part of a select the program sees. */
+#define TAPE_SELECT_MAX_FDS 1024
+
+static int
+tape_fds_out(rb_fdset_t *f, int max, int *out)
+{
+    int n = 0;
+    if (!f) return 0;
+    for (int fd = 0; fd < max && n < TAPE_SELECT_MAX_FDS; fd++) {
+        if (rb_fd_isset(fd, f)) out[n++] = fd;
+    }
+    return n;
+}
+
+static void
+tape_fds_in(rb_fdset_t *f, const int *fds, int n)
+{
+    if (!f) return;
+    rb_fd_zero(f);
+    for (int i = 0; i < n; i++) {
+        rb_fd_resize(fds[i], f);
+        rb_fd_set(fds[i], f);
+    }
+}
+
 int
 rb_thread_fd_select(int max, rb_fdset_t * read, rb_fdset_t * write, rb_fdset_t * except,
                     struct timeval *timeout)
 {
     struct select_set set;
+
+    /* Readiness, off the tape. Nothing is polled: the recorded verdict is written back
+     * into the three sets, and the descriptors it names are the ones the recording found
+     * ready. A replayed select on descriptors that were never opened would otherwise
+     * return an answer the recording never saw -- and for a fiber scheduler, which is a
+     * loop around exactly this call, that decides which fiber runs next. */
+    if (rb_tape_replaying()) {
+        int rfds[TAPE_SELECT_MAX_FDS], wfds[TAPE_SELECT_MAX_FDS], efds[TAPE_SELECT_MAX_FDS];
+        int rn = 0, wn = 0, en = 0;
+        int ret = rb_tape_replay_select(rfds, &rn, wfds, &wn, efds, &en);
+        tape_fds_in(read, rfds, rn);
+        tape_fds_in(write, wfds, wn);
+        tape_fds_in(except, efds, en);
+        return ret;
+    }
 
     set.th = GET_THREAD();
     RUBY_VM_CHECK_INTS_BLOCKING(set.th->ec);
@@ -4704,7 +4746,19 @@ rb_thread_fd_select(int max, rb_fdset_t * read, rb_fdset_t * write, rb_fdset_t *
     fd_init_copy(eset);
 #undef fd_init_copy
 
-    return (int)rb_ensure(do_select, (VALUE)&set, select_set_free, (VALUE)&set);
+    int ret = (int)rb_ensure(do_select, (VALUE)&set, select_set_free, (VALUE)&set);
+    int err = errno;
+
+    if (rb_tape_recording()) {
+        /* The verdict, post-call: which descriptors came back ready. */
+        int rfds[TAPE_SELECT_MAX_FDS], wfds[TAPE_SELECT_MAX_FDS], efds[TAPE_SELECT_MAX_FDS];
+        int rn = tape_fds_out(read, max, rfds);
+        int wn = tape_fds_out(write, max, wfds);
+        int en = tape_fds_out(except, max, efds);
+        rb_tape_record_select(ret, err, rfds, rn, wfds, wn, efds, en);
+    }
+    errno = err;
+    return ret;
 }
 
 #ifdef USE_POLL

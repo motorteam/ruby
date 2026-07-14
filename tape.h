@@ -89,6 +89,50 @@ enum rb_tape_effect {
     RB_TAPE_FS_GETCWD       = 21,
     RB_TAPE_FS_ACCESS       = 22,   /* access(2) and eaccess -- File.readable? &c. */
     RB_TAPE_FS_READLINK     = 23,
+    /**
+     * Not an effect -- a *marker*. Written whenever the thread doing the recording
+     * changes, carrying the new thread's serial.
+     *
+     * A tape is one linear log, and two threads doing IO at once append to it in
+     * whatever order they happen to finish. Nothing is wrong with that as a
+     * *recording* -- it is exactly what happened -- but replaying it as a single
+     * sequence demands that the two threads interleave identically the second time,
+     * which nothing guarantees and which the scheduler will not oblige.
+     * `EnvUtil.invoke_ruby` reads a subprocess's stdout and stderr in two concurrent
+     * threads, and 41 test files diverged on nothing but which of the two got there
+     * first.
+     *
+     * So the markers cut the linear tape into **per-thread subsequences**. On replay
+     * each thread walks its own, and the order *between* threads is left free -- a
+     * partial order, which is all a GVL'd program can honestly promise anyway: within
+     * a thread, effects are totally ordered and must replay exactly; across threads,
+     * only the effects themselves are determined, not their interleaving.
+     *
+     * The marker rides on the effect table rather than in the entry struct, so the
+     * wire format stays Watt's, byte for byte.
+     */
+    RB_TAPE_VM_THREAD       = 24,
+    /**
+     * Subprocesses. Replay was still *really spawning them* -- and that is not just
+     * a leak, it is a deadlock.
+     *
+     * A recorded run spawns a child, writes it a script down a pipe, and waits. On
+     * replay the fork and exec were untaped, so they happened for real -- but the
+     * write that feeds the child is an effect, and effects are suppressed. So the
+     * child sat forever on an empty stdin, the parent sat forever in waitpid, and the
+     * test hung. 45 of them did.
+     *
+     * Half-executing a subprocess is the same mistake as half-executing a mkdir, and
+     * it has the same fix: don't. On replay the spawn returns the recorded pid without
+     * forking anything, waitpid returns the recorded status without waiting, and the
+     * child's output comes back off the tape -- where it was already being recorded,
+     * as ordinary reads of a pipe.
+     */
+    RB_TAPE_PROC_SPAWN      = 25,
+    RB_TAPE_PROC_WAITPID    = 26,
+    /* The fds a pipe hands back. They have to come off the tape too, or the reads that
+     * follow them arrive on descriptors the recording never saw. */
+    RB_TAPE_FS_PIPE         = 27,
     RB_TAPE_EFFECT_MAX
 };
 
@@ -388,6 +432,28 @@ const char *rb_tape_getenv(const char *name);
 
 /** getpid, taped. `long` rather than rb_pid_t so this header stays free of ruby.h. */
 long rb_tape_getpid(void);
+
+/* Subprocesses. `long` for the same reason. On replay none of these touch the host:
+ * the spawn returns the recorded pid without forking, and the wait returns the
+ * recorded status without waiting. */
+long rb_tape_replay_spawn(void);
+void rb_tape_record_spawn(long pid, int err);
+
+long rb_tape_replay_waitpid(int *status);
+void rb_tape_record_waitpid(long pid, int status, int err);
+
+int rb_tape_pipe(int descriptors[2], int (*call)(int[2]));
+
+/**
+ * Stop recording, permanently, on this process.
+ *
+ * Called in the child of a bare `fork` (no exec). The child inherits a live recorder
+ * and, at its exit, would seal *its* tape over the parent's file -- so a program that
+ * forked ended up with a tape of the child instead of the program. The child's
+ * behavior is not lost: what the parent can observe of it comes back through the pipe
+ * it reads, which is already an effect.
+ */
+void rb_tape_disarm(void);
 
 /**
  * Make the std streams' TTY-ness match the tape. Defined in io.c (it needs

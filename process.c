@@ -1037,14 +1037,32 @@ pst_wcoredump(VALUE st)
 static rb_pid_t
 do_waitpid(rb_pid_t pid, int *st, int flags)
 {
+    /* Nothing was ever forked on replay, so there is nothing to wait for -- and
+     * waiting for it is precisely how a replayed test used to hang forever. The status
+     * comes off the tape. See rb_tape_disarm and friends. */
+    if (rb_tape_replaying()) {
+        int status = 0;
+        rb_pid_t ret = (rb_pid_t)rb_tape_replay_waitpid(&status);
+        if (st) *st = status;
+        return ret;
+    }
+
+    rb_pid_t ret;
 #if defined HAVE_WAITPID
-    return waitpid(pid, st, flags);
+    ret = waitpid(pid, st, flags);
 #elif defined HAVE_WAIT4
-    return wait4(pid, st, flags, NULL);
+    ret = wait4(pid, st, flags, NULL);
 #else
 #  error waitpid or wait4 is required.
 #endif
+    int err = errno;
+    if (rb_tape_recording()) {
+        rb_tape_record_waitpid((long)ret, st ? *st : 0, err);
+    }
+    errno = err;
+    return ret;
 }
+
 
 struct waitpid_state {
     struct ccan_list_node wnode;
@@ -4097,19 +4115,86 @@ rb_fork_async_signal_safe(int *status,
                           int (*chfunc)(void*, char *, size_t), void *charg,
                           VALUE fds, char *errmsg, size_t errmsg_buflen)
 {
+    /* The fork behind backticks and IO.popen -- a *different* funnel from
+     * rb_spawn_process, and the one that matters most, because it is what the test
+     * suite's assert_separately and EnvUtil.invoke_ruby end up calling.
+     *
+     * On replay nothing is forked. Returning the recorded pid is not enough on its own:
+     * this function's contract is that the parent also learns whether the child's exec
+     * failed, which it does by reading an error pipe the child writes to. There is no
+     * child, so there is no pipe, and the caller must be told plainly that all is well
+     * -- otherwise it reads a descriptor that does not exist and aborts with
+     * `[ASYNC BUG] set_blocking failed reading child error`. */
+    if (rb_tape_replaying()) {
+        if (status) *status = 0;
+        if (errmsg && errmsg_buflen) errmsg[0] = '\0';
+        return (rb_pid_t)rb_tape_replay_spawn();
+    }
+
     struct rb_process_status process_status;
 
+    /* Paused across the fork: everything fork_check_err does *inside itself* is VM
+     * plumbing, not the program. It opens a private pipe for the child to report an
+     * exec failure on, reads it, and closes it -- and the program never sees any of it.
+     * Recorded, those effects sat on the tape waiting to be replayed by a fork that
+     * replay does not perform.
+     *
+     * The pipe the *program* can see -- the one it reads the child's output from -- is
+     * created by its caller (rb_pipe, io.c) and stays on the tape, where it belongs. */
+    rb_tape_pause();
     rb_pid_t result = fork_check_err(&process_status, chfunc, charg, fds, errmsg, errmsg_buflen, 0);
+    int err = errno;
+    rb_tape_unpause();
 
     if (status) {
         *status = process_status.status;
     }
 
+    if (rb_tape_recording()) rb_tape_record_spawn((long)result, err);
+    errno = err;
     return result;
 }
 
+static rb_pid_t rb_fork_ruby_untaped(int *status);
+
+/*
+ * A bare fork (no exec). Two things to get right, and the tape got neither.
+ *
+ * On replay: do not fork at all. Hand back the pid the recording saw. A replayed child
+ * would re-run the program from the fork point with a tape it does not own, and the
+ * parent would then wait for it -- which is one of the ways a replayed test hung.
+ *
+ * On record: the child inherits a live recorder, and at *its* exit would seal its tape
+ * over the parent's file. A program that forked ended up with a tape of the child
+ * instead of a tape of itself. So the child disarms. Nothing observable is lost: what
+ * the parent can see of the child arrives through the pipe it reads, which is already
+ * an effect.
+ */
 rb_pid_t
 rb_fork_ruby(int *status)
+{
+    if (rb_tape_replaying()) {
+        if (status) *status = 0;
+        return (rb_pid_t)rb_tape_replay_spawn();
+    }
+
+    rb_tape_pause();               /* the fork's own plumbing is not the program */
+    rb_pid_t pid = rb_fork_ruby_untaped(status);
+    int err = errno;
+    rb_tape_unpause();
+
+    if (pid == 0) {
+        rb_tape_disarm();          /* we are the child; this tape is not ours */
+        return pid;
+    }
+
+    if (rb_tape_recording()) rb_tape_record_spawn((long)pid, err);
+    errno = err;
+    return pid;
+}
+
+static rb_pid_t
+rb_fork_ruby_untaped(int *status)
 {
     if (UNLIKELY(!rb_ractor_main_p())) {
         rb_raise(rb_eRactorIsolationError, "can not fork from non-main Ractors");
@@ -4507,8 +4592,36 @@ rb_execarg_commandline(const struct rb_execarg *eargp, VALUE *prog)
 }
 #endif
 
+static rb_pid_t rb_spawn_process_untaped(struct rb_execarg *eargp, char *errmsg, size_t errmsg_buflen);
+
+/*
+ * Every spawn in the language funnels through here. On replay nothing is forked and
+ * nothing is exec'd -- the recorded pid comes back, and the child's output comes off
+ * the tape, where it was already being recorded as ordinary reads of a pipe.
+ *
+ * Spawning it for real was not a leak, it was a deadlock: the write that feeds the
+ * child its script is an effect, and effects are suppressed on replay, so the child sat
+ * on an empty stdin forever while the parent sat in waitpid forever.
+ */
 static rb_pid_t
 rb_spawn_process(struct rb_execarg *eargp, char *errmsg, size_t errmsg_buflen)
+{
+    if (rb_tape_replaying()) {
+        return (rb_pid_t)rb_tape_replay_spawn();
+    }
+
+    rb_tape_pause();               /* the spawn's own plumbing is not the program */
+    rb_pid_t pid = rb_spawn_process_untaped(eargp, errmsg, errmsg_buflen);
+    int err = errno;
+    rb_tape_unpause();
+
+    if (rb_tape_recording()) rb_tape_record_spawn((long)pid, err);
+    errno = err;
+    return pid;
+}
+
+static rb_pid_t
+rb_spawn_process_untaped(struct rb_execarg *eargp, char *errmsg, size_t errmsg_buflen)
 {
     rb_pid_t pid;
 #if !defined HAVE_WORKING_FORK || USE_SPAWNV

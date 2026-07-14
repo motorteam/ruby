@@ -439,17 +439,30 @@ rb_fd_set_nonblock(int fd)
     return 0;
 }
 
+static int
+cloexec_pipe_raw(int descriptors[2])
+{
+#ifdef HAVE_PIPE2
+    return pipe2(descriptors, O_CLOEXEC | O_NONBLOCK);
+#else
+    return pipe(descriptors);
+#endif
+}
+
 int
 rb_cloexec_pipe(int descriptors[2])
 {
-#ifdef HAVE_PIPE2
-    int result = pipe2(descriptors, O_CLOEXEC | O_NONBLOCK);
-#else
-    int result = pipe(descriptors);
-#endif
+    /* The descriptors a pipe hands back go on the tape, because a replayed read is
+     * checked against the fd it was recorded on. Make the pipe for real and the kernel
+     * may well number it differently -- and then every read of it is reported as a
+     * divergence, which would be true and useless. On replay nothing is created; the
+     * recorded pair comes back, as fictional as any other replayed fd. */
+    int result = rb_tape_pipe(descriptors, cloexec_pipe_raw);
 
     if (result < 0)
         return result;
+
+    if (rb_tape_replaying()) return result;   /* no real fds to fix up */
 
 #ifdef __CYGWIN__
     if (result == 0 && descriptors[1] == -1) {

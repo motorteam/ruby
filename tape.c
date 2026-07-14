@@ -221,10 +221,37 @@ static struct {
 
     /* replay */
     size_t cursor;
+
+    /* Loading the program is not running the program. Nonzero while the loader
+     * is reaching for program text; every chokepoint goes transparent. */
+    int paused;
 } tape;
 
-int rb_tape_recording(void) { return tape.recording && !tape.dropped; }
-int rb_tape_replaying(void) { return tape.replaying; }
+int rb_tape_recording(void) { return tape.recording && !tape.dropped && !tape.paused; }
+int rb_tape_replaying(void) { return tape.replaying && !tape.paused; }
+
+/*
+ * A `require` reaches the filesystem twice, and only one of the two halves is
+ * visible from this file. `rb_file_load_ok` (file.c) probes each candidate path
+ * in $LOAD_PATH with rb_cloexec_open -- which is a chokepoint, so it lands on the
+ * tape -- and then Prism reads the source it settled on with a raw open(2) +
+ * mmap(2) of its own (prism/source.c:173,213), which no chokepoint can see. The
+ * result was an open on the tape whose read and close never arrived, so replay
+ * handed the loader a fd that was never opened and the effect stream desynced on
+ * the very next call.
+ *
+ * The fix is not to chase Prism's mmap onto the tape. It is to say what Watt and
+ * the Python port already say: **program text is not an effect.** Watt stores the
+ * assembly alongside the tape and recompiles from it; CPython keeps imports off
+ * the tape entirely. So the loader runs paused, and a replayed program reads its
+ * own source from disk exactly as the recorded one did.
+ *
+ * What this does *not* cover, deliberately: `DATA` (the handle `__END__` leaves
+ * behind, ruby.c) is a file the *program* reads, not text the loader consumed, so
+ * it stays on the tape.
+ */
+void rb_tape_pause(void)   { tape.paused++; }
+void rb_tape_unpause(void) { if (tape.paused > 0) tape.paused--; }
 
 static void
 tape_discard(void)

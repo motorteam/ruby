@@ -7083,15 +7083,22 @@ rb_file_load_ok(const char *path)
                 O_NDELAY |
 #endif
                 0);
+    /* This is the loader probing $LOAD_PATH, not the program reading a file --
+     * and the source it settles on is read by Prism's own raw open+mmap, which
+     * no chokepoint can see. Taping half of that pairing is worse than taping
+     * none of it: replay would hand the loader an fd that was never opened. See
+     * rb_tape_pause(). */
+    rb_tape_pause();
     int fd = rb_cloexec_open(path, mode, 0);
     if (fd < 0) {
-        if (!rb_gc_for_fd(errno)) return 0;
+        if (!rb_gc_for_fd(errno)) { rb_tape_unpause(); return 0; }
         fd = rb_cloexec_open(path, mode, 0);
-        if (fd < 0) return 0;
+        if (fd < 0) { rb_tape_unpause(); return 0; }
     }
     rb_update_max_fd(fd);
     ret = ruby_is_fd_loadable(fd);
     (void)close(fd);
+    rb_tape_unpause();
     return ret;
 }
 #endif

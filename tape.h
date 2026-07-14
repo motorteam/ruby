@@ -86,6 +86,23 @@ int rb_tape_recording(void);
 int rb_tape_replaying(void);
 
 /**
+ * Suspend the tape while the loader reaches for program text.
+ *
+ * Loading the program is not running the program. A `require` opens twice: the
+ * $LOAD_PATH probe in `rb_file_load_ok` (file.c) goes through `rb_cloexec_open`
+ * and so is a chokepoint, while Prism reads the source it settles on with a raw
+ * `open`+`mmap` (prism/source.c) that no chokepoint can see. Taping only the
+ * probe put an open on the tape whose read and close never arrived. Rather than
+ * drag Prism's mmap onto the tape, the loader runs paused -- the same rule Watt
+ * (which stores the assembly beside the tape) and the CPython port (which keeps
+ * imports off it) already follow.
+ *
+ * Nests: a require inside a required file pauses twice and unpauses twice.
+ */
+void rb_tape_pause(void);
+void rb_tape_unpause(void);
+
+/**
  * True if a tape is active at all. The chokepoints test this first so an
  * untaped run pays a single predictable branch and nothing else.
  */

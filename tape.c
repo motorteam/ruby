@@ -457,6 +457,7 @@ rb_tape_scan_argv(int argc, char **argv)
 
 int rb_tape_pinned_seed_p(void) { return tape_flag_seen; }
 
+
 /* Caller holds tape_lock. rb_warn is not an option here: it allocates a Ruby
  * String, and we may have no GVL. */
 static void
@@ -579,6 +580,7 @@ tape_trace_line(size_t idx, int func_index, const char *dir)
 }
 
 static void put_u32(tape_buf *b, uint32_t v);   /* defined with the other LE helpers */
+static void excerpt(tape_buf *out, const uint8_t *bytes, size_t len, size_t at);
 
 /* The absolute index of the entry this thread was last served. Only the divergence
  * messages want it -- there is no global cursor any more, because every thread has
@@ -587,6 +589,17 @@ static void put_u32(tape_buf *b, uint32_t v);   /* defined with the other LE hel
 static RB_THREAD_LOCAL_SPECIFIER size_t tape_last_at;
 #else
 static size_t tape_last_at;
+#endif
+
+/* The bytes a replayed write is *about* to present, parked here so the divergence
+ * report can show them. An unexpected write is nearly always the program telling you
+ * what went wrong -- and swallowing it is exactly what replay does. */
+#ifdef RB_THREAD_LOCAL_SPECIFIER
+static RB_THREAD_LOCAL_SPECIFIER const uint8_t *tape_pending_write;
+static RB_THREAD_LOCAL_SPECIFIER size_t tape_pending_write_len;
+#else
+static const uint8_t *tape_pending_write;
+static size_t tape_pending_write_len;
 #endif
 
 /** Move an entry onto the tape. Caller holds tape_lock; buffers transfer. */
@@ -775,6 +788,21 @@ tape_next(int func_index)
     if (e->func_index != func_index) {
         int recorded = e->func_index;
         rb_nativethread_lock_unlock(&tape_lock);   /* the report re-enters chokepoints */
+
+        /* If the program was trying to *write*, show what. "recorded fs.stat, but the
+         * program called io.write" names two effects and explains neither; the bytes
+         * name the code. (An unexpected write is nearly always the program telling you
+         * what went wrong -- an exception message, a test failure -- and swallowing it
+         * is exactly what replay does.) */
+        if (func_index == RB_TAPE_IO_WRITE && tape_pending_write) {
+            tape_buf show = { 0 };
+            excerpt(&show, tape_pending_write, tape_pending_write_len, 0);
+            tape_diverged("entry %zu (thread %u): recorded %s, but the program wrote "
+                          "%zu bytes: %s",
+                          at, tid, tape_effect_fqn[recorded],
+                          tape_pending_write_len, (const char *)show.ptr);
+        }
+
         tape_diverged("entry %zu (thread %u): recorded %s, but the program called %s",
                       at, tid, tape_effect_fqn[recorded], tape_effect_fqn[func_index]);
     }
@@ -1076,7 +1104,9 @@ tape_echo_write(int fd, const void *buf, size_t len)
 ssize_t
 rb_tape_replay_write(int fd, const void *buf, size_t capa)
 {
+    tape_pending_write = buf; tape_pending_write_len = capa;
     const tape_entry *e = tape_next(RB_TAPE_IO_WRITE);
+    tape_pending_write = NULL;
     check_write_diverged(e, buf, capa);
     tape_echo_write(fd, buf, capa);
     return take_io_result(e);
@@ -1119,7 +1149,11 @@ rb_tape_record_writev(int fd, const struct iovec *iov, int iovcnt, ssize_t ret, 
 ssize_t
 rb_tape_replay_writev(int fd, const struct iovec *iov, int iovcnt)
 {
+    /* The first iovec is enough to name the code; the report only needs a hint. */
+    tape_pending_write = iovcnt ? iov[0].iov_base : NULL;
+    tape_pending_write_len = iovcnt ? iov[0].iov_len : 0;
     const tape_entry *e = tape_next(RB_TAPE_IO_WRITE);
+    tape_pending_write = NULL;
 
     /* Flatten the presented iovecs so they can be compared against the recorded
      * gather, which was stored concatenated. (And so RUBY_TAPE_ECHO has something to

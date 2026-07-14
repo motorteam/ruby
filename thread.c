@@ -1347,12 +1347,21 @@ getclockofday(struct timespec *ts)
     if (clock_gettime(CLOCK_MONOTONIC, ts) == 0)
         return;
 #endif
-    /* No monotonic clock here: CRuby falls back to wall time. rb_timespec_now *is* a
-     * chokepoint, so pause across it -- the scheduler must not leave a clock.realtime
-     * on the tape just because the platform is short a clock. */
-    rb_tape_pause();
-    rb_timespec_now(ts);
-    rb_tape_unpause();
+    /* No monotonic clock here: fall back to wall time, read *raw*. Not through
+     * rb_timespec_now, which is a chokepoint -- and not by pausing around it either,
+     * because a pause on this path is thread-local state on a path the VM may migrate,
+     * and a pause taken on one native thread and released on another leaks. See
+     * native_cond_timeout. */
+    {
+#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_REALTIME)
+        clock_gettime(CLOCK_REALTIME, ts);
+#else
+        struct timeval tv;
+        gettimeofday(&tv, 0);
+        ts->tv_sec = tv.tv_sec;
+        ts->tv_nsec = (long)tv.tv_usec * 1000;
+#endif
+    }
 }
 
 /*

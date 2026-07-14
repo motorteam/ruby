@@ -280,19 +280,34 @@ native_cond_timeout(rb_nativethread_cond_t *cond, const rb_hrtime_t rel)
      * The clocks the program *does* see stay taped -- sleep_hrtime's own deadline
      * loop (thread.c) and Process.clock_gettime -- so a replayed sleep still ends
      * after exactly the number of turns it took when recorded. */
-    rb_tape_pause();
-    rb_hrtime_t abs;
     if (condattr_monotonic) {
-        abs = rb_hrtime_add(rb_hrtime_now(), rel);
+        return rb_hrtime_add(rb_hrtime_now(), rel);
     }
     else {
+        /* Read raw, *not* through rb_timespec_now -- which is a chokepoint.
+         *
+         * Pausing the tape around it was the first fix, and it was a trap. A pause is
+         * thread-local state, and this is one of the hottest paths in the scheduler:
+         * every contended GVL handoff and every condvar wait comes through here. If the
+         * VM moves a Ruby thread between native threads across that window -- and it is
+         * entitled to -- the pause is taken on one and released on another, so the
+         * first leaks a pause that never comes back, and recording is silently switched
+         * *off* for whatever runs on that native thread next. It cost us the test
+         * runner's whole banner: 161 bytes written to fd 1 with the recorder asleep, and
+         * a tape that then diverged 81 files later on a write it had no memory of.
+         *
+         * Not being a chokepoint is safer than being one we have to keep suppressing. */
         struct timespec ts;
-
-        rb_timespec_now(&ts);
-        abs = rb_hrtime_add(rb_timespec2hrtime(&ts), rel);
+#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_REALTIME)
+        clock_gettime(CLOCK_REALTIME, &ts);
+#else
+        struct timeval tv;
+        gettimeofday(&tv, 0);
+        ts.tv_sec = tv.tv_sec;
+        ts.tv_nsec = (long)tv.tv_usec * 1000;
+#endif
+        return rb_hrtime_add(rb_timespec2hrtime(&ts), rel);
     }
-    rb_tape_unpause();
-    return abs;
 }
 
 void

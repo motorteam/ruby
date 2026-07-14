@@ -4125,6 +4125,24 @@ rb_fork_async_signal_safe(int *status,
      * child, so there is no pipe, and the caller must be told plainly that all is well
      * -- otherwise it reads a descriptor that does not exist and aborts with
      * `[ASYNC BUG] set_blocking failed reading child error`. */
+    /* The pre-fork flush, and it happens on *both* paths.
+     *
+     * CRuby flushes stdout and stderr on the way into a fork -- prefork(), so the child
+     * cannot duplicate them -- and that flush is where the program's buffered output
+     * finally reaches the fd. It is an effect, and one of the most consequential ones:
+     * it is where `puts` actually lands.
+     *
+     * It has to happen here, ahead of both the replay shortcut and the pause below.
+     * Inside the pause it vanished from the tape: the test runner's banner sat in
+     * stdout's buffer until the first assert_separately forked, went to fd 1 with the
+     * recorder asleep, and was never recorded. Replay, whose buffer still held it,
+     * tried to write it later and diverged -- 81 test files, all blaming an fs.stat
+     * that had nothing to do with anything. And skipped on the replay path, the mirror
+     * bug: the bytes stay buffered and drain somewhere else, so every write after is
+     * off by one. */
+    rb_io_flush(rb_stdout);
+    rb_io_flush(rb_stderr);
+
     if (rb_tape_replaying()) {
         if (status) *status = 0;
         if (errmsg && errmsg_buflen) errmsg[0] = '\0';
@@ -4137,10 +4155,8 @@ rb_fork_async_signal_safe(int *status,
      * plumbing, not the program. It opens a private pipe for the child to report an
      * exec failure on, reads it, and closes it -- and the program never sees any of it.
      * Recorded, those effects sat on the tape waiting to be replayed by a fork that
-     * replay does not perform.
-     *
-     * The pipe the *program* can see -- the one it reads the child's output from -- is
-     * created by its caller (rb_pipe, io.c) and stays on the tape, where it belongs. */
+     * replay does not perform. With the flush hoisted above, the pause now covers only
+     * that plumbing, which is all it was ever meant to cover. */
     rb_tape_pause();
     rb_pid_t result = fork_check_err(&process_status, chfunc, charg, fds, errmsg, errmsg_buflen, 0);
     int err = errno;
@@ -4173,12 +4189,16 @@ static rb_pid_t rb_fork_ruby_untaped(int *status);
 rb_pid_t
 rb_fork_ruby(int *status)
 {
+    /* On both paths, and ahead of the pause. See rb_fork_async_signal_safe. */
+    rb_io_flush(rb_stdout);
+    rb_io_flush(rb_stderr);
+
     if (rb_tape_replaying()) {
         if (status) *status = 0;
         return (rb_pid_t)rb_tape_replay_spawn();
     }
 
-    rb_tape_pause();               /* the fork's own plumbing is not the program */
+    rb_tape_pause();   /* only the fork's own plumbing -- see rb_fork_async_signal_safe */
     rb_pid_t pid = rb_fork_ruby_untaped(status);
     int err = errno;
     rb_tape_unpause();
@@ -4606,11 +4626,15 @@ static rb_pid_t rb_spawn_process_untaped(struct rb_execarg *eargp, char *errmsg,
 static rb_pid_t
 rb_spawn_process(struct rb_execarg *eargp, char *errmsg, size_t errmsg_buflen)
 {
+    /* On both paths, and ahead of the pause. See rb_fork_async_signal_safe. */
+    rb_io_flush(rb_stdout);
+    rb_io_flush(rb_stderr);
+
     if (rb_tape_replaying()) {
         return (rb_pid_t)rb_tape_replay_spawn();
     }
 
-    rb_tape_pause();               /* the spawn's own plumbing is not the program */
+    rb_tape_pause();   /* only the fork's own plumbing -- see rb_fork_async_signal_safe */
     rb_pid_t pid = rb_spawn_process_untaped(eargp, errmsg, errmsg_buflen);
     int err = errno;
     rb_tape_unpause();

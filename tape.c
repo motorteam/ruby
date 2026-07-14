@@ -562,7 +562,13 @@ tape_trace_line(size_t idx, int func_index, const char *dir)
         tape_break = v && *v ? atol(v) : -1;
     }
     if (tape_tracing()) {
-        fprintf(stderr, "[tape-trace] %6zu %s %s\n", idx, dir,
+        /* The thread matters more than the index now. Global indices shift between
+         * recordings the moment a second thread does IO -- so two record runs of the
+         * same program produce different numbering, and diffing them by index is
+         * meaningless. Diff *per thread* instead: within a thread the sequence is
+         * deterministic, and that is exactly the thing replay has to reproduce. */
+        fprintf(stderr, "[tape-trace] t%-3u %6zu %s %s\n",
+                tape_current_thread(), idx, dir,
                 func_index < RB_TAPE_EFFECT_MAX ? tape_effect_fqn[func_index] : "?");
         fflush(stderr);
     }

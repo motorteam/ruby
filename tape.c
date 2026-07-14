@@ -34,6 +34,7 @@
 
 #include "internal.h"
 #include "ruby/ruby.h"
+#include "ruby/thread_native.h"
 #include "ruby/version.h"
 #include "tape.h"
 #include "vm_core.h"
@@ -95,6 +96,45 @@ static const char *const tape_effect_sig[] = {
     "([[byte]]) -> [[byte]]",   /* env.get -- gather: name; scatter: value */
 };
 
+/* ── Allocation ───────────────────────────────────────────────────────────────
+ *
+ * The tape allocates with plain libc, not with CRuby's xmalloc, and that is a
+ * correctness requirement rather than a preference.
+ *
+ * The recorder runs *with the GVL released*. `internal_read_func` and
+ * `internal_write_func` (io.c) are the functions handed to rb_nogvl -- that is
+ * the whole point of them -- and they call in here from inside that region.
+ * `xmalloc` may trigger a garbage collection, and a garbage collection needs the
+ * GVL. So every xmalloc on the recording path was a latent crash.
+ *
+ * Nor does the tape belong on the GC's books: it is raw bytes with a lifetime
+ * that ends at rb_tape_finish, holding no VALUEs and tracing no references.
+ */
+static void *
+tape_realloc(void *p, size_t n)
+{
+    void *q = realloc(p, n);
+    if (!q && n) {
+        fputs("[tape] out of memory\n", stderr);
+        _exit(EXIT_FAILURE);
+    }
+    return q;
+}
+
+static void *
+tape_malloc(size_t n) { return tape_realloc(NULL, n); }
+
+static void *
+tape_calloc(size_t count, size_t size)
+{
+    void *p = calloc(count ? count : 1, size);
+    if (!p) {
+        fputs("[tape] out of memory\n", stderr);
+        _exit(EXIT_FAILURE);
+    }
+    return p;
+}
+
 /* ── Growable byte buffer ─────────────────────────────────────────────────── */
 
 typedef struct {
@@ -109,7 +149,7 @@ buf_reserve(tape_buf *b, size_t extra)
     if (b->len + extra <= b->cap) return;
     size_t cap = b->cap ? b->cap : 64;
     while (cap < b->len + extra) cap *= 2;
-    b->ptr = xrealloc(b->ptr, cap);
+    b->ptr = tape_realloc(b->ptr, cap);
     b->cap = cap;
 }
 
@@ -132,7 +172,7 @@ buf_byte(tape_buf *b, uint8_t v)
 static void
 buf_free(tape_buf *b)
 {
-    xfree(b->ptr);
+    free(b->ptr);
     b->ptr = NULL;
     b->len = b->cap = 0;
 }
@@ -205,6 +245,7 @@ typedef struct {
     tape_buf ret;
     tape_iov *iovs;
     size_t n_iovs;
+    size_t bytes;   /* iov bytes this entry holds; charged to the ceiling at commit */
 } tape_entry;
 
 static struct {
@@ -226,6 +267,17 @@ static struct {
      * is reaching for program text; every chokepoint goes transparent. */
     int paused;
 } tape;
+
+/*
+ * Chokepoints reach this file from GVL-released regions (see tape_realloc), so
+ * two Ruby threads doing IO at once arrive here genuinely concurrently. The GVL
+ * is not holding anything still for us; this lock is.
+ *
+ * It guards the shared tape only -- the entries array, the byte count, the
+ * replay cursor. An entry is *built* outside it (that is the expensive part: the
+ * memcpy of a read buffer) and only the append is serialized.
+ */
+static rb_nativethread_lock_t tape_lock;
 
 int rb_tape_recording(void) { return tape.recording && !tape.dropped && !tape.paused; }
 int rb_tape_replaying(void) { return tape.replaying && !tape.paused; }
@@ -253,52 +305,95 @@ int rb_tape_replaying(void) { return tape.replaying && !tape.paused; }
 void rb_tape_pause(void)   { tape.paused++; }
 void rb_tape_unpause(void) { if (tape.paused > 0) tape.paused--; }
 
+/* Caller holds tape_lock. rb_warn is not an option here: it allocates a Ruby
+ * String, and we may have no GVL. */
 static void
 tape_discard(void)
 {
     tape.dropped = 1;
     tape.n_entries = 0;
-    rb_warn("tape: exceeded %d bytes; recording dropped", TAPE_CEILING_BYTES);
+    fprintf(stderr, "[tape] exceeded %d bytes; recording dropped\n", TAPE_CEILING_BYTES);
 }
 
-/** Start an entry, or NULL if the tape has been dropped. */
+/**
+ * Start an entry, or NULL if the tape has been dropped.
+ *
+ * The entry is built *off to the side*, on its own allocation, and only joins the
+ * tape at entry_commit. It used to be built in place, at `&tape.entries[n_entries]`
+ * -- with n_entries not yet incremented, so the slot was not reserved. Any second
+ * chokepoint entering between begin and commit (another thread, since we run with
+ * the GVL released) would hand out the *same* slot and clobber it, or grow the
+ * array and leave the first caller writing through a pointer that realloc had
+ * already freed. The corruption surfaced much later, as a SEGV inside the
+ * serializer, on a run that had otherwise passed all its tests.
+ */
 static tape_entry *
 entry_begin(int func_index)
 {
     if (!rb_tape_recording()) return NULL;
-    if (tape.n_entries == tape.cap_entries) {
-        size_t cap = tape.cap_entries ? tape.cap_entries * 2 : 256;
-        tape.entries = xrealloc(tape.entries, cap * sizeof(tape_entry));
-        tape.cap_entries = cap;
-    }
-    tape_entry *e = &tape.entries[tape.n_entries];
-    memset(e, 0, sizeof(*e));
+    tape_entry *e = tape_calloc(1, sizeof(tape_entry));
     e->func_index = func_index;
     e->action = RB_TAPE_ACTION_RESUME;
     return e;
 }
 
-/** Capture one gather/scatter buffer against the ceiling. */
+/** Capture one gather/scatter buffer. Charged against the ceiling at commit. */
 static void
 entry_iov(tape_entry *e, uint8_t arg_index, const void *p, size_t n)
 {
     if (!e) return;
-    if (tape.bytes + n > TAPE_CEILING_BYTES) { tape_discard(); return; }
-    e->iovs = xrealloc(e->iovs, (e->n_iovs + 1) * sizeof(tape_iov));
+    e->iovs = tape_realloc(e->iovs, (e->n_iovs + 1) * sizeof(tape_iov));
     tape_iov *iov = &e->iovs[e->n_iovs++];
     iov->arg_index = arg_index;
     memset(&iov->bytes, 0, sizeof(iov->bytes));
     buf_push(&iov->bytes, p, n);
-    tape.bytes += n;
+    e->bytes += n;
 }
 
+/**
+ * Append the entry to the tape. This is the only place the shared tape is
+ * mutated while recording, so it is the only place that has to be serialized --
+ * the buffer copies in entry_iov, which are the expensive part, happen outside
+ * the lock on the caller's own allocation.
+ *
+ * Takes ownership of `e`: its buffers move into the array, and the shell is
+ * freed. `e` is dead on return.
+ */
 static void
 entry_commit(tape_entry *e)
 {
     if (!e) return;
-    tape.bytes += e->args.len + e->ret.len;
-    if (tape.bytes > TAPE_CEILING_BYTES) { tape_discard(); return; }
-    tape.n_entries++;
+    rb_nativethread_lock_lock(&tape_lock);
+
+    /* Re-check under the lock: another thread may have overrun the ceiling while
+     * this entry was being built. */
+    if (!tape.dropped) {
+        tape.bytes += e->bytes + e->args.len + e->ret.len;
+        if (tape.bytes > TAPE_CEILING_BYTES) {
+            tape_discard();
+        }
+        else {
+            if (tape.n_entries == tape.cap_entries) {
+                size_t cap = tape.cap_entries ? tape.cap_entries * 2 : 256;
+                tape.entries = tape_realloc(tape.entries, cap * sizeof(tape_entry));
+                tape.cap_entries = cap;
+            }
+            tape.entries[tape.n_entries++] = *e;  /* buffers move; no deep copy */
+            e->args.ptr = e->ret.ptr = NULL;
+            e->iovs = NULL;
+            e->n_iovs = 0;                        /* the array owns them now */
+        }
+    }
+
+    rb_nativethread_lock_unlock(&tape_lock);
+
+    /* Whatever the outcome, the shell is ours to free -- and if the tape was
+     * dropped, so are the buffers it still owns. */
+    buf_free(&e->args);
+    buf_free(&e->ret);
+    for (size_t i = 0; i < e->n_iovs; i++) buf_free(&e->iovs[i].bytes);
+    free(e->iovs);
+    free(e);
 }
 
 /* Little-endian scalar helpers for args/return payloads. These mirror the raw
@@ -366,6 +461,12 @@ tape_diverged(const char *fmt, ...)
 static const tape_entry *
 tape_next(int func_index)
 {
+    /* Replay is reached from GVL-released regions too, so the cursor is shared
+     * mutable state under exactly the same conditions as the recorder's array.
+     * The entries themselves are immutable once decoded, so only the bump needs
+     * guarding -- and tape_diverged never returns, so the lock dies with us. */
+    rb_nativethread_lock_lock(&tape_lock);
+
     if (tape.cursor >= tape.n_entries) {
         tape_diverged("ran off the end of the tape at entry %zu; expected no more effects, got %s",
                       tape.cursor, tape_effect_fqn[func_index]);
@@ -376,6 +477,8 @@ tape_next(int func_index)
                       tape.cursor, tape_effect_fqn[e->func_index], tape_effect_fqn[func_index]);
     }
     tape.cursor++;
+
+    rb_nativethread_lock_unlock(&tape_lock);
     return e;
 }
 
@@ -437,8 +540,43 @@ rb_tape_replay_random(void *buf, size_t len)
 
 /* ── Effect: IO ───────────────────────────────────────────────────────────── */
 
+/*
+ * A read or a write is only half-described by what it returned. The other half
+ * is `errno`, and on a failure it is the *whole* story: -1/EAGAIN and -1/EPIPE
+ * send the caller down entirely different paths.
+ *
+ * These two effects used to record the return value alone. So a recorded
+ * -1/EAGAIN -- an ordinary nonblocking read that found nothing -- came back on
+ * replay as -1 with whatever errno happened to be lying around, which is usually
+ * zero, and CRuby's own sanity check fired:
+ *
+ *     [BUG] rb_sys_fail_path_in(io_read_nonblock, ) - errno == 0
+ *
+ * That single omission aborted a quarter of the test suite. fs.open and friends
+ * already did this properly (put_result); io just never used it.
+ *
+ * Only meaningful on failure: errno after a *successful* syscall is stale, and
+ * restoring stale garbage to a replayed process helps nobody. So record it when
+ * ret < 0 and leave errno alone otherwise -- which is exactly the contract every
+ * caller of read(2) already codes against.
+ */
+static void
+put_io_result(tape_entry *e, ssize_t ret, int err)
+{
+    put_i64(&e->ret, (int64_t)ret);
+    put_i64(&e->ret, (int64_t)(ret < 0 ? err : 0));
+}
+
+static ssize_t
+take_io_result(const tape_entry *e)
+{
+    ssize_t ret = (ssize_t)get_i64(e->ret.ptr);
+    if (ret < 0 && e->ret.len >= 16) errno = (int)get_i64(e->ret.ptr + 8);
+    return ret;
+}
+
 void
-rb_tape_record_read(int fd, const void *buf, size_t capa, ssize_t ret)
+rb_tape_record_read(int fd, const void *buf, size_t capa, ssize_t ret, int err)
 {
     tape_entry *e = entry_begin(RB_TAPE_IO_READ);
     if (!e) return;
@@ -446,7 +584,7 @@ rb_tape_record_read(int fd, const void *buf, size_t capa, ssize_t ret)
     put_u32(&e->args, (uint32_t)capa);
     /* Scatter: capture only the filled prefix, as Watt does. */
     if (ret > 0) entry_iov(e, 1, buf, (size_t)ret);
-    put_i64(&e->ret, (int64_t)ret);
+    put_io_result(e, ret, err);
     entry_commit(e);
 }
 
@@ -454,7 +592,7 @@ ssize_t
 rb_tape_replay_read(int fd, void *buf, size_t capa)
 {
     const tape_entry *e = tape_next(RB_TAPE_IO_READ);
-    ssize_t ret = (ssize_t)get_i64(e->ret.ptr);
+    ssize_t ret = take_io_result(e);
     const tape_iov *iov = entry_find_iov(e, 1);
     if (iov && ret > 0) {
         size_t n = iov->bytes.len < capa ? iov->bytes.len : capa;
@@ -471,14 +609,14 @@ rb_tape_replay_read(int fd, void *buf, size_t capa)
  * that actually reached the fd, exactly.
  */
 void
-rb_tape_record_write(int fd, const void *buf, size_t capa, ssize_t ret)
+rb_tape_record_write(int fd, const void *buf, size_t capa, ssize_t ret, int err)
 {
     tape_entry *e = entry_begin(RB_TAPE_IO_WRITE);
     if (!e) return;
     put_u32(&e->args, (uint32_t)fd);
     put_u32(&e->args, (uint32_t)capa);
     if (ret > 0) entry_iov(e, 1, buf, (size_t)ret);
-    put_i64(&e->ret, (int64_t)ret);
+    put_io_result(e, ret, err);
     entry_commit(e);
 }
 
@@ -552,12 +690,12 @@ rb_tape_replay_write(int fd, const void *buf, size_t capa)
 {
     const tape_entry *e = tape_next(RB_TAPE_IO_WRITE);
     check_write_diverged(e, buf, capa);
-    return (ssize_t)get_i64(e->ret.ptr);
+    return take_io_result(e);
 }
 
 #ifdef HAVE_WRITEV
 void
-rb_tape_record_writev(int fd, const struct iovec *iov, int iovcnt, ssize_t ret)
+rb_tape_record_writev(int fd, const struct iovec *iov, int iovcnt, ssize_t ret, int err)
 {
     tape_entry *e = entry_begin(RB_TAPE_IO_WRITE);
     if (!e) return;
@@ -573,7 +711,7 @@ rb_tape_record_writev(int fd, const struct iovec *iov, int iovcnt, ssize_t ret)
     size_t accepted = ret > 0 ? (size_t)ret : 0;
     if (accepted) {
         if (tape.bytes + accepted > TAPE_CEILING_BYTES) { tape_discard(); return; }
-        e->iovs = xrealloc(e->iovs, (e->n_iovs + 1) * sizeof(tape_iov));
+        e->iovs = tape_realloc(e->iovs, (e->n_iovs + 1) * sizeof(tape_iov));
         tape_iov *cap = &e->iovs[e->n_iovs++];
         cap->arg_index = 1;
         memset(&cap->bytes, 0, sizeof(cap->bytes));
@@ -585,7 +723,7 @@ rb_tape_record_writev(int fd, const struct iovec *iov, int iovcnt, ssize_t ret)
         tape.bytes += accepted;
     }
 
-    put_i64(&e->ret, (int64_t)ret);
+    put_io_result(e, ret, err);
     entry_commit(e);
 }
 
@@ -601,7 +739,7 @@ rb_tape_replay_writev(int fd, const struct iovec *iov, int iovcnt)
     check_write_diverged(e, flat.ptr, flat.len);
     buf_free(&flat);
 
-    return (ssize_t)get_i64(e->ret.ptr);
+    return take_io_result(e);
 }
 #endif
 
@@ -917,7 +1055,7 @@ static void
 addrs_grow(void)
 {
     size_t cap = addrs.cap ? addrs.cap * 2 : 1024;
-    addr_slot *slots = xcalloc(cap, sizeof(addr_slot));
+    addr_slot *slots = tape_calloc(cap, sizeof(addr_slot));
     for (size_t i = 0; i < addrs.cap; i++) {
         if (addrs.slots[i].key == 0) {
             continue;
@@ -928,7 +1066,7 @@ addrs_grow(void)
         }
         slots[j] = addrs.slots[i];
     }
-    xfree(addrs.slots);
+    free(addrs.slots);
     addrs.slots = slots;
     addrs.cap = cap;
 }
@@ -1010,7 +1148,7 @@ tape_write_file(void)
     encode_spooled_tape(&body, "main");
 
     size_t bound = ZSTD_compressBound(body.len);
-    uint8_t *z = xmalloc(bound);
+    uint8_t *z = tape_malloc(bound);
     size_t zlen = ZSTD_compress(z, bound, body.ptr, body.len, TAPE_ZSTD_LEVEL);
     if (ZSTD_isError(zlen)) {
         rb_warn("tape: zstd failed: %s", ZSTD_getErrorName(zlen));
@@ -1037,7 +1175,7 @@ tape_write_file(void)
     fprintf(stderr, "[tape] %zu entries -> %s (%zu bytes)\n", tape.n_entries, tape.path, zlen + 1);
 
   done:
-    xfree(z);
+    free(z);
     buf_free(&body);
 }
 
@@ -1106,7 +1244,7 @@ tape_read_file(const char *path)
     fseek(f, 0, SEEK_SET);
     if (size < 1) rb_fatal("tape: %s is empty", path);
 
-    uint8_t *raw = xmalloc((size_t)size);
+    uint8_t *raw = tape_malloc((size_t)size);
     if (fread(raw, 1, (size_t)size, f) != (size_t)size) rb_fatal("tape: short read on %s", path);
     fclose(f);
 
@@ -1118,10 +1256,10 @@ tape_read_file(const char *path)
     if (dlen == ZSTD_CONTENTSIZE_ERROR || dlen == ZSTD_CONTENTSIZE_UNKNOWN) {
         rb_fatal("tape: %s is not a valid zstd frame", path);
     }
-    uint8_t *body = xmalloc((size_t)dlen);
+    uint8_t *body = tape_malloc((size_t)dlen);
     size_t got = ZSTD_decompress(body, (size_t)dlen, raw + 1, (size_t)size - 1);
     if (ZSTD_isError(got)) rb_fatal("tape: zstd decode failed: %s", ZSTD_getErrorName(got));
-    xfree(raw);
+    free(raw);
 
     tape_reader r = { body, body + got };
     rd_skip_str(&r);        /* assembly_hash */
@@ -1131,7 +1269,7 @@ tape_read_file(const char *path)
     rd_skip_str(&r);        /* build_id */
 
     tape.n_entries = (size_t)rd_uvarint(&r);
-    tape.entries = xcalloc(tape.n_entries ? tape.n_entries : 1, sizeof(tape_entry));
+    tape.entries = tape_calloc(tape.n_entries ? tape.n_entries : 1, sizeof(tape_entry));
 
     for (size_t i = 0; i < tape.n_entries; i++) {
         tape_entry *e = &tape.entries[i];
@@ -1139,14 +1277,14 @@ tape_read_file(const char *path)
         e->action = rd_byte(&r);
         rd_bytes(&r, &e->args);
         e->n_iovs = (size_t)rd_uvarint(&r);
-        e->iovs = e->n_iovs ? xcalloc(e->n_iovs, sizeof(tape_iov)) : NULL;
+        e->iovs = e->n_iovs ? tape_calloc(e->n_iovs, sizeof(tape_iov)) : NULL;
         for (size_t j = 0; j < e->n_iovs; j++) {
             e->iovs[j].arg_index = rd_byte(&r);
             rd_bytes(&r, &e->iovs[j].bytes);
         }
         rd_bytes(&r, &e->ret);
     }
-    xfree(body);
+    free(body);
 }
 
 /* ── Inspect ──────────────────────────────────────────────────────────────── */
@@ -1280,7 +1418,15 @@ render_action(tape_buf *out, const tape_entry *e)
         }
     }
     else if (e->ret.len >= 8) {
-        sb_printf(out, "%lld", (long long)get_i64(e->ret.ptr));
+        long long ret = (long long)get_i64(e->ret.ptr);
+        sb_printf(out, "%lld", ret);
+        /* A failed effect is only half-told by its return value. The errno is the
+         * other half -- and it is the half replay re-raises -- so a reader who
+         * sees `resume(-1)` and nothing else has been told nothing at all. */
+        if (ret < 0 && e->ret.len >= 16) {
+            int err = (int)get_i64(e->ret.ptr + 8);
+            if (err) sb_printf(out, " %s", strerror(err));
+        }
     }
     for (size_t i = 0; i < e->n_iovs; i++) {
         /* iov[0] of a path effect is already the Args column; don't repeat it. */
@@ -1314,7 +1460,7 @@ rb_tape_inspect(const char *path)
 
     /* One cell buffer per column per row, plus the header row. */
     size_t nrows = tape.n_entries + 1;
-    tape_buf *cells = xcalloc(nrows * TAPE_INSPECT_COLS, sizeof(tape_buf));
+    tape_buf *cells = tape_calloc(nrows * TAPE_INSPECT_COLS, sizeof(tape_buf));
 
     for (int c = 0; c < TAPE_INSPECT_COLS; c++) {
         sb_printf(&cells[c], "%s", header[c]);
@@ -1356,7 +1502,7 @@ rb_tape_inspect(const char *path)
     rule(inner, '-');
 
     for (size_t i = 0; i < nrows * TAPE_INSPECT_COLS; i++) buf_free(&cells[i]);
-    xfree(cells);
+    free(cells);
 }
 
 /* ── Lifecycle ────────────────────────────────────────────────────────────── */
@@ -1365,7 +1511,7 @@ static char *
 tape_strdup(const char *s)
 {
     size_t n = strlen(s) + 1;
-    char *out = xmalloc(n);
+    char *out = tape_malloc(n);
     memcpy(out, s, n);
     return out;
 }
@@ -1373,6 +1519,7 @@ tape_strdup(const char *s)
 void
 rb_tape_record_to(const char *path)
 {
+    rb_nativethread_lock_initialize(&tape_lock);
     tape.recording = 1;
     tape.path = tape_strdup(path);
 }
@@ -1380,6 +1527,7 @@ rb_tape_record_to(const char *path)
 void
 rb_tape_replay_from(const char *path)
 {
+    rb_nativethread_lock_initialize(&tape_lock);
     tape.replaying = 1;
     tape.path = tape_strdup(path);
     tape_read_file(path);

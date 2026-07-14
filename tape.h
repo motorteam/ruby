@@ -119,10 +119,21 @@ void rb_tape_replay_clock(int effect, struct timespec *ts);
 void rb_tape_record_random(const void *buf, size_t len, int ret);
 int  rb_tape_replay_random(void *buf, size_t len);
 
-void   rb_tape_record_read(int fd, const void *buf, size_t capa, ssize_t ret);
+/*
+ * `err` is the errno the syscall left behind, and on a failure it is not a
+ * detail -- it *is* the result. -1/EAGAIN (a nonblocking read that found
+ * nothing) and -1/EPIPE (the peer is gone) send the caller down completely
+ * different paths, and a tape that records only the -1 cannot tell them apart.
+ *
+ * It is recorded only when ret < 0; errno after a successful syscall is stale,
+ * and handing stale garbage back to a replayed process helps nobody. Pass the
+ * errno captured *immediately* after the syscall -- anything in between (a
+ * retry, a wait, a GVL reacquire) will have clobbered it.
+ */
+void   rb_tape_record_read(int fd, const void *buf, size_t capa, ssize_t ret, int err);
 ssize_t rb_tape_replay_read(int fd, void *buf, size_t capa);
 
-void   rb_tape_record_write(int fd, const void *buf, size_t capa, ssize_t ret);
+void   rb_tape_record_write(int fd, const void *buf, size_t capa, ssize_t ret, int err);
 ssize_t rb_tape_replay_write(int fd, const void *buf, size_t capa);
 
 /* ── Filesystem: drop-in wrappers ─────────────────────────────────────────────
@@ -212,7 +223,7 @@ void rb_tape_reconcile_stdio_tty(void);
  * concatenation of every iovec, with no per-buffer framing -- which is exactly
  * how Watt captures a gather arg, so the two agree byte for byte.
  */
-void   rb_tape_record_writev(int fd, const struct iovec *iov, int iovcnt, ssize_t ret);
+void   rb_tape_record_writev(int fd, const struct iovec *iov, int iovcnt, ssize_t ret, int err);
 ssize_t rb_tape_replay_writev(int fd, const struct iovec *iov, int iovcnt);
 #endif
 

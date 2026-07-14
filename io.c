@@ -1209,11 +1209,27 @@ io_internal_wait(VALUE thread, rb_io_t *fptr, int error, int events, struct time
     }
 }
 
+/* Record and return, preserving the errno the syscall left behind: the recorder
+ * allocates, and an allocator is free to clobber errno on its way through. Every
+ * exit from these functions goes through here -- a path that returns without
+ * recording would leave the tape one entry short and desync replay at the next
+ * effect, which is exactly what the bare `return -1`s below used to do. */
+static VALUE
+tape_read_result(struct io_internal_read_struct *iis, ssize_t result, int err)
+{
+    if (rb_tape_recording()) {
+        rb_tape_record_read(iis->fd, iis->buf, iis->capa, result, err);
+    }
+    errno = err;
+    return (VALUE)result;
+}
+
 static VALUE
 internal_read_func(void *ptr)
 {
     struct io_internal_read_struct *iis = ptr;
     ssize_t result;
+    int err;
 
     if (rb_tape_replaying()) {
         return (VALUE)rb_tape_replay_read(iis->fd, iis->buf, iis->capa);
@@ -1221,17 +1237,18 @@ internal_read_func(void *ptr)
 
     if (iis->timeout && !iis->nonblock) {
         if (io_internal_wait(iis->th, iis->fptr, 0, RB_WAITFD_IN, iis->timeout) == -1) {
-            return -1;
+            return tape_read_result(iis, -1, errno);
         }
     }
 
   retry:
     result = read(iis->fd, iis->buf, iis->capa);
+    err = errno;
 
     if (result < 0 && !iis->nonblock) {
-        if (io_again_p(errno)) {
-            if (io_internal_wait(iis->th, iis->fptr, errno, RB_WAITFD_IN, iis->timeout) == -1) {
-                return -1;
+        if (io_again_p(err)) {
+            if (io_internal_wait(iis->th, iis->fptr, err, RB_WAITFD_IN, iis->timeout) == -1) {
+                return tape_read_result(iis, -1, errno);
             }
             else {
                 goto retry;
@@ -1239,11 +1256,7 @@ internal_read_func(void *ptr)
         }
     }
 
-    if (rb_tape_recording()) {
-        rb_tape_record_read(iis->fd, iis->buf, iis->capa, result);
-    }
-
-    return result;
+    return tape_read_result(iis, result, err);
 }
 
 #if defined __APPLE__
@@ -1253,10 +1266,21 @@ internal_read_func(void *ptr)
 #endif
 
 static VALUE
+tape_write_result(struct io_internal_write_struct *iis, ssize_t result, int err)
+{
+    if (rb_tape_recording()) {
+        rb_tape_record_write(iis->fd, iis->buf, iis->capa, result, err);
+    }
+    errno = err;
+    return (VALUE)result;
+}
+
+static VALUE
 internal_write_func(void *ptr)
 {
     struct io_internal_write_struct *iis = ptr;
     ssize_t result;
+    int err;
 
     /* Replay never re-performs an effect, so the bytes go nowhere: we only
      * report what the recorded write returned. The bytes themselves are on the
@@ -1268,18 +1292,18 @@ internal_write_func(void *ptr)
 
     if (iis->timeout && !iis->nonblock) {
         if (io_internal_wait(iis->th, iis->fptr, 0, RB_WAITFD_OUT, iis->timeout) == -1) {
-            return -1;
+            return tape_write_result(iis, -1, errno);
         }
     }
 
   retry:
     do_write_retry(write(iis->fd, iis->buf, iis->capa));
+    err = errno;
 
     if (result < 0 && !iis->nonblock) {
-        int e = errno;
-        if (io_again_p(e)) {
-            if (io_internal_wait(iis->th, iis->fptr, errno, RB_WAITFD_OUT, iis->timeout) == -1) {
-                return -1;
+        if (io_again_p(err)) {
+            if (io_internal_wait(iis->th, iis->fptr, err, RB_WAITFD_OUT, iis->timeout) == -1) {
+                return tape_write_result(iis, -1, errno);
             }
             else {
                 goto retry;
@@ -1287,19 +1311,26 @@ internal_write_func(void *ptr)
         }
     }
 
-    if (rb_tape_recording()) {
-        rb_tape_record_write(iis->fd, iis->buf, iis->capa, result);
-    }
-
-    return result;
+    return tape_write_result(iis, result, err);
 }
 
 #ifdef HAVE_WRITEV
+static VALUE
+tape_writev_result(struct io_internal_writev_struct *iis, ssize_t result, int err)
+{
+    if (rb_tape_recording()) {
+        rb_tape_record_writev(iis->fd, iis->iov, iis->iovcnt, result, err);
+    }
+    errno = err;
+    return (VALUE)result;
+}
+
 static VALUE
 internal_writev_func(void *ptr)
 {
     struct io_internal_writev_struct *iis = ptr;
     ssize_t result;
+    int err;
 
     /* Buffered writes (`puts`) land here rather than in internal_write_func. */
     if (rb_tape_replaying()) {
@@ -1308,17 +1339,18 @@ internal_writev_func(void *ptr)
 
     if (iis->timeout && !iis->nonblock) {
         if (io_internal_wait(iis->th, iis->fptr, 0, RB_WAITFD_OUT, iis->timeout) == -1) {
-            return -1;
+            return tape_writev_result(iis, -1, errno);
         }
     }
 
   retry:
     do_write_retry(writev(iis->fd, iis->iov, iis->iovcnt));
+    err = errno;
 
     if (result < 0 && !iis->nonblock) {
-        if (io_again_p(errno)) {
-            if (io_internal_wait(iis->th, iis->fptr, errno, RB_WAITFD_OUT, iis->timeout) == -1) {
-                return -1;
+        if (io_again_p(err)) {
+            if (io_internal_wait(iis->th, iis->fptr, err, RB_WAITFD_OUT, iis->timeout) == -1) {
+                return tape_writev_result(iis, -1, errno);
             }
             else {
                 goto retry;
@@ -1326,11 +1358,7 @@ internal_writev_func(void *ptr)
         }
     }
 
-    if (rb_tape_recording()) {
-        rb_tape_record_writev(iis->fd, iis->iov, iis->iovcnt, result);
-    }
-
-    return result;
+    return tape_writev_result(iis, result, err);
 }
 #endif
 
@@ -1458,8 +1486,10 @@ io_flush_buffer_sync(void *arg)
     }
     else {
         r = write(fptr->fd, wbuf, (size_t)l);
+        int err = errno;
         if (rb_tape_recording()) {
-            rb_tape_record_write(fptr->fd, wbuf, (size_t)l, r);
+            rb_tape_record_write(fptr->fd, wbuf, (size_t)l, r, err);
+            errno = err;  /* the recorder allocates; don't let it eat the errno */
         }
     }
 
@@ -9303,7 +9333,9 @@ rb_write_error_str(VALUE mesg)
                 RB_GC_GUARD(mesg);
                 return;  /* replay re-performs no effect */
             }
-            rb_tape_record_write(fd, RSTRING_PTR(mesg), len, (ssize_t)len);
+            /* Recorded ahead of the stdio write below, which we assume takes the
+             * whole message -- so there is no errno yet to capture. */
+            rb_tape_record_write(fd, RSTRING_PTR(mesg), len, (ssize_t)len, 0);
         }
 
 #ifdef _WIN32

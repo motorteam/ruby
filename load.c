@@ -5,6 +5,7 @@
 #include "dln.h"
 #include "eval_intern.h"
 #include "internal.h"
+#include "tape.h"
 #include "internal/box.h"
 #include "internal/dir.h"
 #include "internal/error.h"
@@ -96,7 +97,13 @@ rb_construct_expanded_load_path(rb_box_t *box, enum expand_type type, int *has_r
         if (is_string)
             rb_str_freeze(path);
         as_str = rb_get_path_check_convert(as_str);
+        /* The loader resolving $LOAD_PATH. Program text is not an effect -- the same
+         * rule rb_file_load_ok follows -- and realpath *is* a chokepoint, so without
+         * this the tape records one entry per load-path entry, every time the load
+         * path changes. */
+        rb_tape_pause();
         expanded_path = rb_check_realpath(Qnil, as_str, NULL);
+        rb_tape_unpause();
         if (NIL_P(expanded_path)) expanded_path = as_str;
         long len = RSTRING_LEN(expanded_path);
         if (len > maxlen) maxlen = len;
@@ -406,7 +413,14 @@ get_loaded_features_index(const rb_box_t *box)
             VALUE as_str = rb_ary_entry(features, i);
             VALUE realpath = rb_hash_aref(previous_realpath_map, as_str);
             if (NIL_P(realpath)) {
+                /* Same, for the loaded-features index -- and this one *memoizes*, in
+                 * previous_realpath_map. So the number of realpaths it performs depends
+                 * on which features were already resolved, which is to say on the
+                 * program's load history rather than on anything it did. Fifty rubygems
+                 * files diverged on exactly that. */
+                rb_tape_pause();
                 realpath = rb_check_realpath(Qnil, as_str, NULL);
+                rb_tape_unpause();
                 if (NIL_P(realpath)) realpath = as_str;
                 realpath = rb_fstring(realpath);
             }

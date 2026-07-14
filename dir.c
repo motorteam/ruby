@@ -1247,7 +1247,7 @@ nogvl_chdir(void *ptr)
 {
     const char *path = ptr;
 
-    return (void *)(VALUE)chdir(path);
+    return (void *)(VALUE)rb_tape_chdir(path);
 }
 
 static void
@@ -1629,7 +1629,7 @@ VALUE
 rb_dir_getwd_ospath(void)
 {
     char buf[PATH_MAX];
-    char *path = getcwd(buf, PATH_MAX);
+    char *path = rb_tape_getcwd(buf, PATH_MAX);
     if (!path) {
         return rb_dir_getwd_ospath_slowpath();
     }

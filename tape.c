@@ -73,6 +73,9 @@ static const char *const tape_effect_fqn[] = {
     "proc.getpid",
     "fs.mutate",
     "fs.realpath",
+    "fs.getcwd",
+    "fs.access",
+    "fs.readlink",
 };
 
 /* Effect signatures, for the Signature column of `--tape-inspect`. Ruby is
@@ -101,6 +104,9 @@ static const char *const tape_effect_sig[] = {
     "() -> int",                /* proc.getpid */
     "(op, [[byte]]) -> int",    /* fs.mutate -- gather: the path(s); op names which */
     "([[byte]]) -> [[byte]]",   /* fs.realpath -- gather: the path; scatter: resolved */
+    "() -> [[byte]]",           /* fs.getcwd   -- scatter: the cwd */
+    "([[byte]], int) -> int",   /* fs.access   -- gather: the path; mode in args */
+    "([[byte]]) -> [[byte]]",   /* fs.readlink -- gather: the path; scatter: the target */
 };
 
 /* ── Allocation ───────────────────────────────────────────────────────────────
@@ -1204,6 +1210,12 @@ fs_mutate_record(int op, const char *a, const char *b, int ret, int err)
 int rb_tape_mkdir(const char *path, mode_t mode) TAPE_FS_1(mkdir, RB_TAPE_FS_OP_MKDIR, mkdir(path, mode))
 int rb_tape_rmdir(const char *path)              TAPE_FS_1(rmdir, RB_TAPE_FS_OP_RMDIR, rmdir(path))
 int rb_tape_unlink(const char *path)             TAPE_FS_1(unlink, RB_TAPE_FS_OP_UNLINK, unlink(path))
+/* chdir mutates the process rather than the filesystem, but it is the same shape and
+ * replay must do the same thing with it: serve the recorded result and stay put. A
+ * replayed program does not *have* the directory it chdir'd into -- replay is what
+ * declined to create it -- so letting the real chdir run raises ENOENT, and the
+ * program then dies somewhere with nothing to do with tapes. */
+int rb_tape_chdir(const char *path)              TAPE_FS_1(chdir, RB_TAPE_FS_OP_CHDIR, chdir(path))
 int rb_tape_chmod(const char *path, mode_t mode) TAPE_FS_1(chmod, RB_TAPE_FS_OP_CHMOD, chmod(path, mode))
 int rb_tape_truncate(const char *path, off_t len) TAPE_FS_1(truncate, RB_TAPE_FS_OP_TRUNCATE, truncate(path, len))
 
@@ -1260,6 +1272,113 @@ rb_tape_ftruncate(int fd, off_t len)
     int ret = ftruncate(fd, len);
     int err = errno;
     fs_mutate_record(RB_TAPE_FS_OP_FTRUNCATE, NULL, NULL, ret, err);
+    errno = err;
+    return ret;
+}
+
+/*
+ * getcwd, access, readlink -- the rest of the path-based surface.
+ *
+ * None of these looked urgent while replay was still quietly executing mkdir for
+ * real: the directories were all there, so asking the live filesystem about them
+ * gave the same answers the recording got. Suppressing the mutations is what made
+ * them load-bearing. A replayed program's temp directory does not exist, so `Dir.pwd`
+ * inside it, `File.readable?` on a file under it, and `File.readlink` of a link in it
+ * all now have to come off the tape or the program dies somewhere unrelated.
+ */
+char *
+rb_tape_getcwd(char *buf, size_t size)
+{
+    if (rb_tape_replaying()) {
+        const tape_entry *e = tape_next(RB_TAPE_FS_GETCWD);
+        if (take_result(e) != 0) return NULL;   /* errno restored */
+        const tape_iov *iov = entry_find_iov(e, 0);
+        if (!iov) return NULL;
+        /* getcwd(3) mallocs when handed a NULL buffer, and the caller frees it. */
+        char *out = buf ? buf : tape_malloc(iov->bytes.len + 1);
+        memcpy(out, iov->bytes.ptr, iov->bytes.len);
+        out[iov->bytes.len] = '\0';
+        return out;
+    }
+
+    char *ret = getcwd(buf, size);
+    int err = errno;
+
+    if (rb_tape_recording()) {
+        tape_entry *e = entry_begin(RB_TAPE_FS_GETCWD);
+        if (e) {
+            if (ret) entry_iov(e, 0, ret, strlen(ret));
+            put_result(e, ret ? 0 : -1, err);
+            entry_commit(e);
+        }
+    }
+    errno = err;
+    return ret;
+}
+
+/* `call` is access(2) or file.c's eaccess -- which is static there, so it comes in
+ * as a pointer, the same way tape_stat takes stat/lstat/fstat. `effective` only
+ * distinguishes the two on the tape: File.readable? and File.readable_real? ask
+ * different questions and may get different answers. */
+int
+rb_tape_access(const char *path, int mode, int effective, int (*call)(const char *, int))
+{
+    if (rb_tape_replaying()) {
+        const tape_entry *e = tape_next(RB_TAPE_FS_ACCESS);
+        check_path_diverged(e, path);
+        return take_result(e);
+    }
+
+    int ret = call(path, mode);
+    int err = errno;
+
+    if (rb_tape_recording()) {
+        tape_entry *e = entry_begin(RB_TAPE_FS_ACCESS);
+        if (e) {
+            put_u32(&e->args, (uint32_t)mode);
+            put_u32(&e->args, (uint32_t)effective);
+            entry_iov(e, 0, path, strlen(path));
+            put_result(e, ret, err);
+            entry_commit(e);
+        }
+    }
+    errno = err;
+    return ret;
+}
+
+ssize_t
+rb_tape_readlink(const char *path, char *buf, size_t size)
+{
+    if (rb_tape_replaying()) {
+        const tape_entry *e = tape_next(RB_TAPE_FS_READLINK);
+        check_path_diverged(e, path);
+        ssize_t ret = (ssize_t)get_i64(e->ret.ptr);
+        if (ret < 0) {
+            if (e->ret.len >= 16) errno = (int)get_i64(e->ret.ptr + 8);
+            return ret;
+        }
+        const tape_iov *iov = entry_find_iov(e, 1);
+        if (iov) {
+            size_t n = iov->bytes.len < size ? iov->bytes.len : size;
+            memcpy(buf, iov->bytes.ptr, n);
+            return (ssize_t)n;
+        }
+        return ret;
+    }
+
+    ssize_t ret = readlink(path, buf, size);
+    int err = errno;
+
+    if (rb_tape_recording()) {
+        tape_entry *e = entry_begin(RB_TAPE_FS_READLINK);
+        if (e) {
+            entry_iov(e, 0, path, strlen(path));
+            if (ret > 0) entry_iov(e, 1, buf, (size_t)ret);
+            put_i64(&e->ret, (int64_t)ret);
+            put_i64(&e->ret, (int64_t)(ret < 0 ? err : 0));
+            entry_commit(e);
+        }
+    }
     errno = err;
     return ret;
 }

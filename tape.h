@@ -80,6 +80,15 @@ enum rb_tape_effect {
      * emulation, and the extra stats desynced the tape. The fifth time this tree has
      * taught the same lesson -- the funnel is never where you think. */
     RB_TAPE_FS_REALPATH     = 20,
+    /* The rest of the path-based surface. All of these became *load-bearing* the
+     * moment replay stopped creating directories for real: a program whose temp
+     * directory was never made now asks the live filesystem about it, and gets a
+     * different answer than the recording did. `Dir.chdir` into a suppressed tmpdir
+     * raises ENOENT, and the test blows up in setup with nothing on the tape to say
+     * why. */
+    RB_TAPE_FS_GETCWD       = 21,
+    RB_TAPE_FS_ACCESS       = 22,   /* access(2) and eaccess -- File.readable? &c. */
+    RB_TAPE_FS_READLINK     = 23,
     RB_TAPE_EFFECT_MAX
 };
 
@@ -110,6 +119,11 @@ enum rb_tape_fs_op {
     RB_TAPE_FS_OP_TRUNCATE  = 10,
     RB_TAPE_FS_OP_FTRUNCATE = 11,
     RB_TAPE_FS_OP_UTIMES    = 12,
+    /* chdir mutates the process, not the filesystem -- but it is the same shape and
+     * replay must do the same thing with it: serve the recorded result and stay put.
+     * A replayed program does not have the directory it chdir'd into, because replay
+     * is what declined to create it. */
+    RB_TAPE_FS_OP_CHDIR     = 13,
     RB_TAPE_FS_OP_MAX
 };
 
@@ -293,6 +307,17 @@ off_t rb_tape_lseek(int fd, off_t offset, int whence);
  * exists (and, more to the point, one that replay deliberately never created).
  */
 char *rb_tape_realpath(const char *path, char *resolved);
+
+int rb_tape_chdir(const char *path);
+char *rb_tape_getcwd(char *buf, size_t size);
+/**
+ * access(2). `call` is access or file.c's eaccess (which is static there, so it comes
+ * in as a pointer, the way tape_stat takes stat/lstat/fstat). `effective` only
+ * separates the two on the tape: File.readable? and File.readable_real? ask different
+ * questions and may get different answers.
+ */
+int rb_tape_access(const char *path, int mode, int effective, int (*call)(const char *, int));
+ssize_t rb_tape_readlink(const char *path, char *buf, size_t size);
 
 /* The filesystem mutations. Drop-ins, like the rest: same signature, same
  * semantics, errno included. On replay they touch nothing and serve the recorded

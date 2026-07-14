@@ -1546,7 +1546,7 @@ static void *
 no_gvl_lstat(void *ptr)
 {
     no_gvl_stat_data *arg = ptr;
-    return (void *)(VALUE)lstat(arg->file.path, arg->st);
+    return (void *)(VALUE)rb_tape_lstat(arg->file.path, arg->st);
 }
 
 static int
@@ -1731,7 +1731,7 @@ nogvl_eaccess(void *ptr)
 {
     struct access_arg *aa = ptr;
 
-    return (void *)(VALUE)eaccess(aa->path, aa->mode);
+    return (void *)(VALUE)rb_tape_access(aa->path, aa->mode, 1, eaccess);
 }
 
 static int
@@ -1752,7 +1752,7 @@ nogvl_access(void *ptr)
 {
     struct access_arg *aa = ptr;
 
-    return (void *)(VALUE)access(aa->path, aa->mode);
+    return (void *)(VALUE)rb_tape_access(aa->path, aa->mode, 0, access);
 }
 
 static int
@@ -2588,7 +2588,7 @@ rb_file_atime(VALUE obj)
     struct stat st;
 
     GetOpenFile(obj, fptr);
-    if (fstat(fptr->fd, &st) == -1) {
+    if (rb_tape_fstat(fptr->fd, &st) == -1) {
         rb_sys_fail_path(fptr->pathv);
     }
     return stat_time(stat_atimespec(&st));
@@ -2636,7 +2636,7 @@ rb_file_mtime(VALUE obj)
     struct stat st;
 
     GetOpenFile(obj, fptr);
-    if (fstat(fptr->fd, &st) == -1) {
+    if (rb_tape_fstat(fptr->fd, &st) == -1) {
         rb_sys_fail_path(fptr->pathv);
     }
     return stat_time(stat_mtimespec(&st));
@@ -2691,7 +2691,7 @@ rb_file_ctime(VALUE obj)
     struct stat st;
 
     GetOpenFile(obj, fptr);
-    if (fstat(fptr->fd, &st) == -1) {
+    if (rb_tape_fstat(fptr->fd, &st) == -1) {
         rb_sys_fail_path(fptr->pathv);
     }
     return stat_time(stat_ctimespec(&st));
@@ -2781,7 +2781,7 @@ rb_file_size(VALUE file)
             rb_io_flush_raw(file, 0);
         }
 
-        if (fstat(fptr->fd, &st) == -1) {
+        if (rb_tape_fstat(fptr->fd, &st) == -1) {
             rb_sys_fail_path(fptr->pathv);
         }
 
@@ -3602,7 +3602,7 @@ nogvl_readlink(void *ptr)
 {
     struct readlink_arg *ra = ptr;
 
-    return (void *)(VALUE)readlink(ra->path, ra->buf, ra->size);
+    return (void *)(VALUE)rb_tape_readlink(ra->path, ra->buf, ra->size);
 }
 
 static ssize_t
@@ -7052,7 +7052,7 @@ ruby_is_fd_loadable(int fd)
 #else
     struct stat st;
 
-    if (fstat(fd, &st) < 0)
+    if (rb_tape_fstat(fd, &st) < 0)
         return 0;
 
     if (S_ISREG(st.st_mode))

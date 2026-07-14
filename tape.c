@@ -23,6 +23,7 @@
 #include "ruby/internal/config.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,6 +81,7 @@ static const char *const tape_effect_fqn[] = {
     "proc.spawn",
     "proc.waitpid",
     "fs.pipe",
+    "fs.fcntl",
 };
 
 /* Effect signatures, for the Signature column of `--tape-inspect`. Ruby is
@@ -115,6 +117,7 @@ static const char *const tape_effect_sig[] = {
     "() -> int",                /* proc.spawn   -> pid */
     "() -> (int, int)",         /* proc.waitpid -> (pid, status) */
     "() -> (int, int)",         /* fs.pipe      -> (read fd, write fd) */
+    "(int, int) -> int",        /* fs.fcntl     -- (fd, cmd) -> flags */
 };
 
 /* ── Allocation ───────────────────────────────────────────────────────────────
@@ -1042,11 +1045,40 @@ check_write_diverged(const tape_entry *e, const void *buf, size_t capa)
                   tape_last_at, at, (const char *)was.ptr, (const char *)now.ptr);
 }
 
+/*
+ * RUBY_TAPE_ECHO=1 -- let a replayed program's output through to the terminal.
+ *
+ * Replay suppresses writes: nothing the program prints reaches the fd, because
+ * re-performing an effect is exactly what replay does not do. Which is right, and which
+ * makes a replayed program that *fails* almost impossible to debug -- the exception
+ * message it prints is a write, so it is swallowed, and all you are left with is a
+ * divergence at some entry, and a backtrace sitting in `rescue in run`.
+ *
+ * So: echo it. Only for the standard streams, which are real descriptors on any run;
+ * the rest are fictions the tape hands out. Off by default -- it puts bytes on a
+ * terminal that a hermetic replay has no business putting there.
+ */
+static int tape_echo = -1;
+
+static void
+tape_echo_write(int fd, const void *buf, size_t len)
+{
+    if (tape_echo < 0) {
+        const char *v = getenv("RUBY_TAPE_ECHO");
+        tape_echo = (v && *v && *v != '0') ? 1 : 0;
+    }
+    if (tape_echo && (fd == 1 || fd == 2) && len) {
+        ssize_t ignored = write(fd, buf, len);
+        (void)ignored;
+    }
+}
+
 ssize_t
 rb_tape_replay_write(int fd, const void *buf, size_t capa)
 {
     const tape_entry *e = tape_next(RB_TAPE_IO_WRITE);
     check_write_diverged(e, buf, capa);
+    tape_echo_write(fd, buf, capa);
     return take_io_result(e);
 }
 
@@ -1090,10 +1122,12 @@ rb_tape_replay_writev(int fd, const struct iovec *iov, int iovcnt)
     const tape_entry *e = tape_next(RB_TAPE_IO_WRITE);
 
     /* Flatten the presented iovecs so they can be compared against the recorded
-     * gather, which was stored concatenated. */
+     * gather, which was stored concatenated. (And so RUBY_TAPE_ECHO has something to
+     * echo -- `puts` reaches the fd through here, not through write.) */
     tape_buf flat = { 0 };
     for (int i = 0; i < iovcnt; i++) buf_push(&flat, iov[i].iov_base, iov[i].iov_len);
     check_write_diverged(e, flat.ptr, flat.len);
+    tape_echo_write(fd, flat.ptr, flat.len);
     buf_free(&flat);
 
     return take_io_result(e);
@@ -1811,6 +1845,39 @@ rb_tape_pipe(int descriptors[2], int (*call)(int[2]))
             put_i64(&e->ret, (int64_t)ret);
             put_i64(&e->ret, (int64_t)(ret < 0 ? err : descriptors[0]));
             put_i64(&e->ret, (int64_t)(ret < 0 ? err : descriptors[1]));
+            entry_commit(e);
+        }
+    }
+    errno = err;
+    return ret;
+}
+
+/*
+ * fcntl(fd, F_GETFL) -- how `IO.new(fd)` interrogates a descriptor before it will wrap
+ * one. On a replayed fd, which was never opened, it fails; IO.new raises EBADF; and the
+ * program dies somewhere with nothing to do with tapes.
+ *
+ * This is the same trap rb_cloexec_open sidesteps by returning before its own cloexec
+ * fixups -- but those are the VM's bookkeeping, and can simply be skipped. This one the
+ * *program* is asking, through IO.new, so it has to be answered rather than skipped.
+ */
+int
+rb_tape_fcntl(int fd, int cmd)
+{
+    if (rb_tape_replaying()) {
+        const tape_entry *e = tape_next(RB_TAPE_FS_FCNTL);
+        return take_result(e);
+    }
+
+    int ret = fcntl(fd, cmd);
+    int err = errno;
+
+    if (rb_tape_recording()) {
+        tape_entry *e = entry_begin(RB_TAPE_FS_FCNTL);
+        if (e) {
+            put_u32(&e->args, (uint32_t)fd);
+            put_u32(&e->args, (uint32_t)cmd);
+            put_result(e, ret, err);
             entry_commit(e);
         }
     }

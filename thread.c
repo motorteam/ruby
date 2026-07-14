@@ -1321,39 +1321,38 @@ thread_value(VALUE self)
  */
 
 /*
- * The monotonic clock -- and therefore every sleep, every timeout, and every
- * stopwatch in the language. It has to be on the tape for the same reason the
- * wall clock does, but also for a sharper one: it shares a loop with the wall
- * clock. `sleep_hrtime` (below) computes its deadline through native_cond_timeout,
- * which reads the *realtime* clock, and then tests for completion here, against
- * the *monotonic* one. Tape only one of the two and replay freezes the deadline
- * in the past while the live clock says "not yet" -- and sleep spins forever.
+ * The scheduler's clock, and *not* the program's -- so it stays off the tape.
+ *
+ * Nothing here ever reaches Ruby. rb_hrtime_now exists to answer one question, "how
+ * long should this thread park", and its only callers are sleep_hrtime, the condvar
+ * deadlines, and the timer thread. The monotonic clock the *program* reads is
+ * Process.clock_gettime, which has its own chokepoint in process.c and is taped there.
+ *
+ * Taping it here looked right and was wrong, because *how many times we get here*
+ * depends on things the program does not control. The wait loop below turns as many
+ * times as it takes for the event to arrive -- so a `Thread#join` recorded while the
+ * joined thread was still working reads the clock several times, and the same join
+ * replayed against a thread whose IO now comes off the tape finishes on the first turn
+ * and reads it once. 164 test files diverged on exactly that.
+ *
+ * Off the tape, replay simply waits: the deadline comes from the live clock, the loop
+ * tests the live clock, and a sleeping program sleeps. (The spin this hook was
+ * introduced to fix stays fixed -- that bug was mixing a *taped* clock with an untaped
+ * one in the same loop. Both are untaped now, so they agree.)
  */
 static void
 getclockofday(struct timespec *ts)
 {
-    if (rb_tape_replaying()) {
-        rb_tape_replay_clock(RB_TAPE_CLOCK_MONOTONIC, RB_TAPE_CLOCKID_MONOTONIC, ts);
-        return;
-    }
-
-    int got = 0;
 #if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
-    got = (clock_gettime(CLOCK_MONOTONIC, ts) == 0);
+    if (clock_gettime(CLOCK_MONOTONIC, ts) == 0)
+        return;
 #endif
-    if (!got) {
-        /* No monotonic clock on this platform: CRuby falls back to wall time.
-         * rb_timespec_now is itself a chokepoint, so pause across it -- this read
-         * must land on the tape as the clock.monotonic the caller asked for, not
-         * as a second clock.realtime. */
-        rb_tape_pause();
-        rb_timespec_now(ts);
-        rb_tape_unpause();
-    }
-
-    if (rb_tape_recording()) {
-        rb_tape_record_clock(RB_TAPE_CLOCK_MONOTONIC, RB_TAPE_CLOCKID_MONOTONIC, ts);
-    }
+    /* No monotonic clock here: CRuby falls back to wall time. rb_timespec_now *is* a
+     * chokepoint, so pause across it -- the scheduler must not leave a clock.realtime
+     * on the tape just because the platform is short a clock. */
+    rb_tape_pause();
+    rb_timespec_now(ts);
+    rb_tape_unpause();
 }
 
 /*

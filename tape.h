@@ -133,6 +133,12 @@ enum rb_tape_effect {
     /* The fds a pipe hands back. They have to come off the tape too, or the reads that
      * follow them arrive on descriptors the recording never saw. */
     RB_TAPE_FS_PIPE         = 27,
+    /* fcntl(fd, F_GETFL) -- how `IO.new(fd)` interrogates a descriptor before it will
+     * wrap it. On a replayed fd, which was never opened, it fails, IO.new raises
+     * EBADF, and the program dies in a place that has nothing to do with tapes. This
+     * is the same trap rb_cloexec_open already sidesteps by returning before its own
+     * fixups; IO.new asks on the program's behalf, so it has to be answered instead. */
+    RB_TAPE_FS_FCNTL        = 28,
     RB_TAPE_EFFECT_MAX
 };
 
@@ -443,6 +449,9 @@ long rb_tape_replay_waitpid(int *status);
 void rb_tape_record_waitpid(long pid, int status, int err);
 
 int rb_tape_pipe(int descriptors[2], int (*call)(int[2]));
+
+/** fcntl(fd, cmd) -- the one-argument commands, F_GETFL and friends. */
+int rb_tape_fcntl(int fd, int cmd);
 
 /**
  * Stop recording, permanently, on this process.

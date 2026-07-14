@@ -257,18 +257,27 @@ rb_update_max_fd(int fd)
     if (fd < 0 || afd <= max_fd)
         return;
 
+    /* This is the VM keeping its own books, not the program asking anything -- so on
+     * replay it is skipped rather than served. A replayed fd was never opened, and
+     * asking the kernel to vouch for it would rb_bug on a descriptor that is *supposed*
+     * to be a fiction. */
+    if (rb_tape_replaying()) {
+        goto record_max;
+    }
+
 #if defined(HAVE_FCNTL) && defined(F_GETFL)
     err = fcntl(fd, F_GETFL) == -1;
 #else
     {
         struct stat buf;
-        err = rb_tape_fstat(fd, &buf) != 0;
+        err = fstat(fd, &buf) != 0;
     }
 #endif
     if (err && errno == EBADF) {
         rb_bug("rb_update_max_fd: invalid fd (%d) given.", fd);
     }
 
+  record_max:
     while (max_fd < afd) {
         max_fd = ATOMIC_CAS(max_file_descriptor, max_fd, afd);
     }
@@ -9709,11 +9718,16 @@ io_initialize(VALUE io, VALUE fnum, VALUE vmode, VALUE opt)
     if (rb_reserved_fd_p(fd)) {
         rb_raise(rb_eArgError, "The given fd is not accessible because RubyVM reserves it");
     }
+    /* IO.new(fd) interrogating the descriptor it is about to wrap. Through the tape:
+     * a replayed fd was never opened, so asking the kernel about it fails, IO.new
+     * raises EBADF, and the program dies in a place that has nothing to do with tapes.
+     * `assert_separately` opens a pipe and wraps both ends, so this was on the path of
+     * a great many tests. */
 #if defined(HAVE_FCNTL) && defined(F_GETFL)
-    oflags = fcntl(fd, F_GETFL);
+    oflags = rb_tape_fcntl(fd, F_GETFL);
     if (oflags == -1) rb_sys_fail(0);
 #else
-    if (fstat(fd, &st) < 0) rb_sys_fail(0);
+    if (rb_tape_fstat(fd, &st) < 0) rb_sys_fail(0);
 #endif
     rb_update_max_fd(fd);
 #if defined(HAVE_FCNTL) && defined(F_GETFL)

@@ -1912,6 +1912,12 @@ ruby_opt_init(ruby_cmdline_options_t *opt)
      * before the tape existed. Put it back to what the recording saw. */
     rb_tape_reconcile_stdio_tty();
 
+    /* The load path as it stands *right here* -- before -r, before the script, before
+     * any user code -- is the interpreter's own library. Everything under it is stdlib:
+     * versioned with the binary, guaranteed present at replay, and therefore not an
+     * effect. Everything else is the program's text, and goes on the tape. */
+    rb_tape_snapshot_stdlib_path();
+
     ruby_set_script_name(opt->script_name);
     if (rb_box_available()) {
         require_libraries_in_main_box(&opt->req_list);

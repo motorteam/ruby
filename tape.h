@@ -153,6 +153,35 @@ enum rb_tape_effect {
      * back ready*, which is the only thing the program can see.
      */
     RB_TAPE_IO_SELECT       = 29,
+    /**
+     * Program text -- the half of the loader that *is* an effect.
+     *
+     * The founding rule was "program text is not an effect", and for a program whose
+     * source is static and present at replay it is exactly right: Watt stores the
+     * assembly beside the tape and recompiles; CPython keeps imports off the tape.
+     *
+     * It is exactly wrong for a program that **writes code at runtime and then loads
+     * it**, which is what a package manager's test suite does for a living. Replay
+     * (correctly) never creates the directories the recording created, so a `require`
+     * that succeeded when the tape was cut finds nothing -- and because the loader ran
+     * paused, *nothing on the tape disagreed*. The program's state simply parted company
+     * with the recording, silently, and diverged a thousand effects later somewhere
+     * unrelated. Forty-nine test files.
+     *
+     * So the line is drawn where it actually holds: **the interpreter's own library
+     * directories -- the load path as it stands before any user code runs -- are off the
+     * tape.** They are versioned with the binary, and a tape already carries a build_id,
+     * so a tape only ever replays against the ruby that cut it. Everything else is the
+     * program's, might differ between runs, and goes on the tape.
+     *
+     * That also buys something the tape could not do before: **it now notices when the
+     * program's own source has changed.** Edit a file, replay an old tape, and the load
+     * diverges at the file -- which is Watt's assembly hash, arrived at from the other
+     * direction, and it is what makes "record before a refactor, replay after" mean
+     * anything.
+     */
+    RB_TAPE_FS_LOADOK       = 30,   /* the $LOAD_PATH probe's verdict (rb_file_load_ok) */
+    RB_TAPE_FS_LOADFILE     = 31,   /* the source Prism actually read */
     RB_TAPE_EFFECT_MAX
 };
 
@@ -261,6 +290,26 @@ void rb_tape_thread_off(void);
  * knowing this early that a tape is coming.
  */
 void rb_tape_scan_argv(int argc, char **argv);
+
+/**
+ * Snapshot the interpreter's own library directories: the load path as it stands
+ * *before any user code runs*. Called from ruby.c right after the tape is armed.
+ *
+ * Everything under them is the stdlib -- versioned with the binary, guaranteed present
+ * at replay, and therefore not an effect. Everything else is the program's.
+ */
+void rb_tape_snapshot_stdlib_path(void);
+
+/** True if `path` is the program's own text rather than the interpreter's library. */
+int rb_tape_program_text_p(const char *path);
+
+/* The loader, for program text only. See RB_TAPE_FS_LOADOK. */
+int rb_tape_replay_loadok(const char *path);
+void rb_tape_record_loadok(const char *path, int ok);
+
+/** Returns a pointer into the tape (valid for the process's life), or NULL. */
+const unsigned char *rb_tape_replay_loadfile(const char *path, size_t *len);
+void rb_tape_record_loadfile(const char *path, const unsigned char *bytes, size_t len);
 
 /** True if the hash salt should be pinned rather than drawn from entropy. */
 int rb_tape_pinned_seed_p(void);

@@ -83,6 +83,8 @@ static const char *const tape_effect_fqn[] = {
     "fs.pipe",
     "fs.fcntl",
     "io.select",
+    "fs.loadok",
+    "fs.loadfile",
 };
 
 /* Effect signatures, for the Signature column of `--tape-inspect`. Ruby is
@@ -120,6 +122,8 @@ static const char *const tape_effect_sig[] = {
     "() -> (int, int)",         /* fs.pipe      -> (read fd, write fd) */
     "(int, int) -> int",        /* fs.fcntl     -- (fd, cmd) -> flags */
     "([[int]], [[int]], [[int]]) -> int",  /* io.select -- scatter: the ready fds */
+    "([[byte]]) -> bool",       /* fs.loadok   -- gather: the candidate path */
+    "([[byte]]) -> [[byte]]",   /* fs.loadfile -- gather: the path; scatter: the source */
 };
 
 /* ── Allocation ───────────────────────────────────────────────────────────────
@@ -588,6 +592,7 @@ tape_trace_line(size_t idx, int func_index, const char *dir)
 }
 
 static void put_u32(tape_buf *b, uint32_t v);   /* defined with the other LE helpers */
+static char *tape_strdup(const char *s);
 static void excerpt(tape_buf *out, const uint8_t *bytes, size_t len, size_t at);
 
 /* The absolute index of the entry this thread was last served. Only the divergence
@@ -1799,6 +1804,114 @@ rb_tape_getpid(void)
         }
     }
     return pid;
+}
+
+/* ── The loader, revisited: which text is the program's ───────────────────────
+ *
+ * "Program text is not an effect" is right for a program whose source is static and
+ * present at replay -- Watt's assumption, and CPython's. It is wrong for a program that
+ * **writes code at runtime and then loads it**, which is what a package manager's test
+ * suite does for a living: replay (correctly) never creates the directories the
+ * recording created, so a `require` that succeeded when the tape was cut finds nothing.
+ * And because the loader ran paused, *nothing on the tape disagreed*. The program's
+ * state parted company with the recording in silence, and diverged a thousand effects
+ * later somewhere unrelated.
+ *
+ * So the line is drawn where it actually holds: **the interpreter's own library
+ * directories -- the load path as it stands before any user code runs -- are off the
+ * tape.** They are versioned with the binary, and a tape carries a build_id, so a tape
+ * only ever replays against the ruby that cut it. Everything else is the program's,
+ * might differ between runs, and goes on the tape.
+ *
+ * The bonus, and it is not small: the tape now **notices when the program's own source
+ * has changed.** Edit a file, replay an old tape, and the load diverges at that file --
+ * Watt's assembly hash, arrived at from the other direction.
+ */
+static char **tape_stdlib_dirs;
+static size_t tape_n_stdlib_dirs;
+
+void
+rb_tape_snapshot_stdlib_path(void)
+{
+    /* Paused: expanding a path reads the cwd, and the interpreter taking stock of its
+     * own library directories is not the program doing anything. */
+    rb_tape_pause();
+
+    VALUE load_path = rb_gv_get("$:");
+    if (RB_TYPE_P(load_path, T_ARRAY)) {
+        long n = RARRAY_LEN(load_path);
+        tape_stdlib_dirs = tape_calloc((size_t)n ? (size_t)n : 1, sizeof(char *));
+        for (long i = 0; i < n; i++) {
+            VALUE dir = rb_ary_entry(load_path, i);
+            if (!RB_TYPE_P(dir, T_STRING)) continue;
+            VALUE full = rb_file_expand_path(dir, Qnil);
+            tape_stdlib_dirs[tape_n_stdlib_dirs++] = tape_strdup(StringValueCStr(full));
+        }
+    }
+
+    rb_tape_unpause();
+}
+
+int
+rb_tape_program_text_p(const char *path)
+{
+    /* Before the snapshot exists -- the interpreter's own startup -- nothing is the
+     * program's yet. */
+    if (!tape_n_stdlib_dirs || !path || path[0] != '/') return 0;
+
+    for (size_t i = 0; i < tape_n_stdlib_dirs; i++) {
+        const char *dir = tape_stdlib_dirs[i];
+        size_t len = strlen(dir);
+        if (len && strncmp(path, dir, len) == 0 && (path[len] == '/' || path[len] == '\0')) {
+            return 0;   /* under the interpreter's own library */
+        }
+    }
+    return 1;
+}
+
+int
+rb_tape_replay_loadok(const char *path)
+{
+    const tape_entry *e = tape_next(RB_TAPE_FS_LOADOK);
+    check_path_diverged(e, path);
+    return take_result(e);
+}
+
+void
+rb_tape_record_loadok(const char *path, int ok)
+{
+    if (!rb_tape_recording()) return;
+    tape_entry *e = entry_begin(RB_TAPE_FS_LOADOK);
+    if (!e) return;
+    entry_iov(e, 0, path, strlen(path));
+    put_result(e, ok, 0);
+    entry_commit(e);
+}
+
+const unsigned char *
+rb_tape_replay_loadfile(const char *path, size_t *len)
+{
+    const tape_entry *e = tape_next(RB_TAPE_FS_LOADFILE);
+    check_path_diverged(e, path);
+    *len = 0;
+    if (take_result(e) != 0) return NULL;      /* the recording could not read it either */
+
+    const tape_iov *iov = entry_find_iov(e, 1);
+    if (!iov) return (const unsigned char *)"";   /* an empty file is still a file */
+    *len = iov->bytes.len;
+    return iov->bytes.ptr;
+}
+
+void
+rb_tape_record_loadfile(const char *path, const unsigned char *bytes, size_t len)
+{
+    if (!rb_tape_recording()) return;
+    tape_entry *e = entry_begin(RB_TAPE_FS_LOADFILE);
+    if (!e) return;
+    entry_iov(e, 0, path, strlen(path));
+    if (bytes && len) entry_iov(e, 1, bytes, len);
+    put_result(e, bytes ? 0 : -1, 0);
+    entry_commit(e);
 }
 
 /* ── Effect: readiness ────────────────────────────────────────────────────────

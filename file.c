@@ -7071,9 +7071,14 @@ ruby_is_fd_loadable(int fd)
 }
 
 #ifndef _WIN32
-int
-rb_file_load_ok(const char *path)
+static int
+file_load_ok_raw(const char *path)
 {
+    /* The *verdict* is the effect here -- "is there a loadable file at this path" --
+     * and never the open/fstat/close that produce it. Those are the probe's own
+     * plumbing, and taping them would hand a replayed loader an fd that was never
+     * opened. So the raw probe always runs paused, and rb_file_load_ok decides
+     * separately whether the verdict itself belongs on the tape. */
     int ret = 1;
     /*
       open(2) may block if path is FIFO and it's empty. Let's use O_NONBLOCK.
@@ -7086,11 +7091,6 @@ rb_file_load_ok(const char *path)
                 O_NDELAY |
 #endif
                 0);
-    /* This is the loader probing $LOAD_PATH, not the program reading a file --
-     * and the source it settles on is read by Prism's own raw open+mmap, which
-     * no chokepoint can see. Taping half of that pairing is worse than taping
-     * none of it: replay would hand the loader an fd that was never opened. See
-     * rb_tape_pause(). */
     rb_tape_pause();
     int fd = rb_cloexec_open(path, mode, 0);
     if (fd < 0) {
@@ -7102,6 +7102,26 @@ rb_file_load_ok(const char *path)
     ret = ruby_is_fd_loadable(fd);
     (void)close(fd);
     rb_tape_unpause();
+    return ret;
+}
+
+int
+rb_file_load_ok(const char *path)
+{
+    /* The interpreter's own library is not an effect: it is versioned with the binary
+     * and guaranteed present at replay. The program's text is -- it may not be present
+     * at replay at all, because a program that *creates* a .rb file and then loads it
+     * is loading something replay never wrote. See rb_tape_program_text_p. */
+    if (!rb_tape_program_text_p(path)) {
+        return file_load_ok_raw(path);
+    }
+
+    if (rb_tape_replaying()) {
+        return rb_tape_replay_loadok(path);
+    }
+
+    int ret = file_load_ok_raw(path);
+    rb_tape_record_loadok(path, ret);
     return ret;
 }
 #endif

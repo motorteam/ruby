@@ -1,4 +1,5 @@
 #include "prism.h"
+#include "tape.h"
 #include "ruby/version.h"
 
 #include <fcntl.h>
@@ -11503,8 +11504,42 @@ VALUE
 pm_load_file(pm_parse_result_t *result, VALUE filepath, bool load_error)
 {
     pm_source_init_result_t init_result;
-    result->source = pm_source_mapped_new(RSTRING_PTR(filepath), O_RDONLY | O_NONBLOCK, &init_result);
+    const char *tape_path = RSTRING_PTR(filepath);
 
+    /* The source itself, and the one place it is actually read. Prism hands the whole
+     * path to libc and mmaps it, which is why no other chokepoint has ever seen a
+     * `require`.
+     *
+     * The interpreter's own library stays off the tape -- it is versioned with the
+     * binary and will be there at replay. The program's text goes *on* it, because it
+     * may not: a program that writes a .rb file and then loads it is loading something
+     * replay never wrote. See rb_tape_program_text_p. */
+    if (rb_tape_program_text_p(tape_path)) {
+        if (rb_tape_replaying()) {
+            size_t length = 0;
+            const unsigned char *bytes = rb_tape_replay_loadfile(tape_path, &length);
+
+            if (bytes) {
+                uint8_t *source_data = xmalloc(length ? length : 1);
+                memcpy(source_data, bytes, length);
+                result->source = pm_source_owned_new(source_data, length);
+                pm_options_frozen_string_literal_init(result->options);
+                return Qnil;
+            }
+            init_result = PM_SOURCE_INIT_ERROR_GENERIC;   /* unreadable when recorded, too */
+            goto tape_error;
+        }
+
+        result->source = pm_source_mapped_new(tape_path, O_RDONLY | O_NONBLOCK, &init_result);
+        rb_tape_record_loadfile(tape_path,
+                                init_result == PM_SOURCE_INIT_SUCCESS ? pm_source_source(result->source) : NULL,
+                                init_result == PM_SOURCE_INIT_SUCCESS ? pm_source_length(result->source) : 0);
+    }
+    else {
+        result->source = pm_source_mapped_new(tape_path, O_RDONLY | O_NONBLOCK, &init_result);
+    }
+
+  tape_error:
     if (init_result == PM_SOURCE_INIT_SUCCESS) {
         pm_options_frozen_string_literal_init(result->options);
         return Qnil;

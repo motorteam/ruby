@@ -1963,6 +1963,15 @@ nogvl_stat(void *args)
 static int
 do_stat(int fd, const char *path, struct stat *pst, int flags, rb_encoding *enc)
 {
+    /* Glob types its matches with fstatat(2), not stat(2), so file.c's chokepoint
+     * never saw these. On replay they must come off the tape like every other stat, or
+     * a glob over a suppressed directory gets a live answer. AT_FDCWD only; a Dir-object
+     * base still stats relative to a live fd. */
+    if (RB_TAPE_ACTIVE() && fd == (int)AT_FDCWD) {
+        int tret = rb_tape_stat(path, pst);
+        if (tret < 0 && !to_be_ignored(errno)) sys_warning(path, enc);
+        return tret;
+    }
 #if USE_OPENDIR_AT
     struct fstatat_args args;
     args.fd = fd;
@@ -1995,6 +2004,12 @@ nogvl_lstat(void *args)
 static int
 do_lstat(int fd, const char *path, struct stat *pst, int flags, rb_encoding *enc)
 {
+    /* See do_stat: glob's own lstat is fstatat(2) and reached no chokepoint. */
+    if (RB_TAPE_ACTIVE() && fd == (int)AT_FDCWD) {
+        int tret = rb_tape_lstat(path, pst);
+        if (tret < 0 && !to_be_ignored(errno)) sys_warning(path, enc);
+        return tret;
+    }
 #if USE_OPENDIR_AT
     struct fstatat_args args;
     args.fd = fd;
@@ -2086,6 +2101,16 @@ opendir_at(int basefd, const char *path)
 
     oaa.basefd = basefd;
     oaa.path = path;
+
+    /* Glob opens its directories here, and this was the half of the glob funnel that
+     * never reached the tape: READDIR is taped, this openat/fdopendir was not, so a
+     * replayed glob enumerated a directory that replay never created. Route the
+     * ordinary (AT_FDCWD) case through the same wrapper Dir.open already uses. A glob
+     * with a Dir-object `base:` still opens relative to a live fd and is not covered --
+     * that would need the base's fd threaded onto the tape. */
+    if (RB_TAPE_ACTIVE() && basefd == (int)AT_FDCWD) {
+        return rb_tape_opendir(path);
+    }
 
     if (vm_initialized)
         return IO_WITHOUT_GVL(nogvl_opendir_at, &oaa);
@@ -2396,24 +2421,73 @@ replace_real_basename(char *path, long base, rb_encoding *enc, int norm_p, int f
     long len;
     char *tmp;
     IF_NORMALIZE_UTF8PATH(VALUE utf8str = Qnil);
+    char taped_name[MAXPATHLEN];
+    int objtype;
 
     *type = path_noent;
-    struct getattrlist_args args = GETATTRLIST_ARGS(&al, attrbuf, FSOPT_NOFOLLOW);
-    if (gvl_getattrlist(&args, path)) {
-        if (!to_be_ignored(errno))
-            sys_warning(path, enc);
-        return path;
+
+    /* getattrlist(2) is the one syscall Dir.glob asks about a plain path component on
+     * this platform -- "does it exist, what type is it, how is it really spelled" -- and
+     * it is not open, not stat, not lstat, so it reached no chokepoint. Untaped, a
+     * replayed glob asked the live filesystem about a directory replay had declined to
+     * create, got path_noent, and returned zero matches having recorded nothing at all.
+     * See RB_TAPE_FS_REALNAME. */
+    if (RB_TAPE_ACTIVE()) {
+        int ret;
+
+        if (rb_tape_replaying()) {
+            ret = rb_tape_replay_realname(path, taped_name, sizeof(taped_name), &objtype);
+        }
+        else {
+            struct getattrlist_args targs = GETATTRLIST_ARGS(&al, attrbuf, FSOPT_NOFOLLOW);
+            ret = gvl_getattrlist(&targs, path);
+            int err = errno;
+            objtype = 0;
+            if (ret == 0) {
+                objtype = (int)attrbuf[0].objtype;
+                const char *rn = (const char *)ar + ar->attr_dataoffset;
+                long rl = (long)ar->attr_length - 1;
+                if (rl < 0 || rn + rl > (char *)attrbuf + sizeof(attrbuf) ||
+                    (size_t)rl >= sizeof(taped_name)) {
+                    ret = -1;
+                    err = ENAMETOOLONG;
+                }
+                else {
+                    memcpy(taped_name, rn, (size_t)rl);
+                    taped_name[rl] = '\0';
+                }
+            }
+            rb_tape_record_realname(path, ret == 0 ? taped_name : NULL, objtype, ret, err);
+            errno = err;
+        }
+
+        if (ret != 0) {
+            if (!to_be_ignored(errno))
+                sys_warning(path, enc);
+            return path;
+        }
+        name = taped_name;
+        len = (long)strlen(taped_name);
+    }
+    else {
+        struct getattrlist_args args = GETATTRLIST_ARGS(&al, attrbuf, FSOPT_NOFOLLOW);
+        if (gvl_getattrlist(&args, path)) {
+            if (!to_be_ignored(errno))
+                sys_warning(path, enc);
+            return path;
+        }
+        objtype = (int)attrbuf[0].objtype;
+        name = (char *)ar + ar->attr_dataoffset;
+        len = (long)ar->attr_length - 1;
     }
 
-    switch (attrbuf[0].objtype) {
+    switch (objtype) {
       case VREG: *type = path_regular; break;
       case VDIR: *type = path_directory; break;
       case VLNK: *type = path_symlink; break;
       default: *type = path_exist; break;
     }
-    name = (char *)ar + ar->attr_dataoffset;
-    len = (long)ar->attr_length - 1;
-    if (name + len > (char *)attrbuf + sizeof(attrbuf))
+    if (name + len > (char *)attrbuf + sizeof(attrbuf) && name != taped_name)
         return path;
 
 # if NORMALIZE_UTF8PATH

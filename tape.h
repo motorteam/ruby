@@ -182,6 +182,31 @@ enum rb_tape_effect {
      */
     RB_TAPE_FS_LOADOK       = 30,   /* the $LOAD_PATH probe's verdict (rb_file_load_ok) */
     RB_TAPE_FS_LOADFILE     = 31,   /* the source Prism actually read */
+    /**
+     * The real name of a path -- `getattrlist(2)`, and the sixth time the funnel was
+     * not where we thought.
+     *
+     * On macOS every *plain* component of every glob is resolved by
+     * `replace_real_basename` (dir.c), which asks getattrlist for three things at once:
+     * does this path exist, what type is it, and what is its real on-disk spelling.
+     * It is not open, not stat, not lstat -- it is a single Darwin syscall that no
+     * chokepoint in this tree could see, and `Dir.glob` asks it *before* it opens
+     * anything.
+     *
+     * Untaped, a replayed glob therefore asked the *live* filesystem about a directory
+     * that replay had (correctly) declined to create, was told path_noent, and returned
+     * zero matches **having emitted not one tape entry**. Nothing disagreed, because
+     * nothing was recorded. The program's Ruby-level state simply parted company with
+     * the recording -- `Gem::Specification.stubs` came back empty -- and diverged
+     * hundreds of effects later somewhere with nothing to do with directories.
+     *
+     * This is the whole rubygems cluster, and it is not a rubygems bug: a seven-line
+     * program that globs a tmpdir and then deletes it could not replay.
+     *
+     * (On Linux there is no getattrlist, USE_NAME_ON_FS is 0, and glob reaches the same
+     * directories through do_opendir instead -- which is why this hid so well.)
+     */
+    RB_TAPE_FS_REALNAME     = 32,
     RB_TAPE_EFFECT_MAX
 };
 
@@ -310,6 +335,16 @@ void rb_tape_record_loadok(const char *path, int ok);
 /** Returns a pointer into the tape (valid for the process's life), or NULL. */
 const unsigned char *rb_tape_replay_loadfile(const char *path, size_t *len);
 void rb_tape_record_loadfile(const char *path, const unsigned char *bytes, size_t len);
+
+/**
+ * getattrlist(2)'s answer, taped. See RB_TAPE_FS_REALNAME.
+ *
+ * `objtype` is the platform's fsobj_type_t, carried opaquely: the tape does not need to
+ * know what VREG means, only that the replay must be told the same thing the recording
+ * was. Returns 0 and fills `name`/`objtype`, or -1 with errno restored.
+ */
+int  rb_tape_replay_realname(const char *path, char *name, size_t cap, int *objtype);
+void rb_tape_record_realname(const char *path, const char *name, int objtype, int ret, int err);
 
 /** True if the hash salt should be pinned rather than drawn from entropy. */
 int rb_tape_pinned_seed_p(void);

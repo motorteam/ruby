@@ -85,6 +85,7 @@ static const char *const tape_effect_fqn[] = {
     "io.select",
     "fs.loadok",
     "fs.loadfile",
+    "fs.realname",
 };
 
 /* Effect signatures, for the Signature column of `--tape-inspect`. Ruby is
@@ -124,6 +125,7 @@ static const char *const tape_effect_sig[] = {
     "([[int]], [[int]], [[int]]) -> int",  /* io.select -- scatter: the ready fds */
     "([[byte]]) -> bool",       /* fs.loadok   -- gather: the candidate path */
     "([[byte]]) -> [[byte]]",   /* fs.loadfile -- gather: the path; scatter: the source */
+    "([[byte]]) -> ([[byte]], int)", /* fs.realname -- gather: path; scatter: real name, type */
 };
 
 /* ── Allocation ───────────────────────────────────────────────────────────────
@@ -1912,6 +1914,56 @@ rb_tape_record_loadfile(const char *path, const unsigned char *bytes, size_t len
     if (bytes && len) entry_iov(e, 1, bytes, len);
     put_result(e, bytes ? 0 : -1, 0);
     entry_commit(e);
+}
+
+/* ── Effect: the real name of a path ──────────────────────────────────────────
+ *
+ * macOS answers "does this path exist, what type is it, and how is it really spelled"
+ * with one getattrlist(2) -- and that is the *first* question Dir.glob asks about every
+ * plain component of a pattern (replace_real_basename, dir.c). It is not open, not
+ * stat, not lstat, so no chokepoint in this tree ever saw it.
+ *
+ * Untaped, a replayed glob asked the live filesystem about a directory replay had
+ * declined to create, was told it did not exist, and returned zero matches having put
+ * *nothing at all* on the tape. Nothing disagreed, because nothing was recorded -- the
+ * program's state just quietly stopped matching the recording. That was the rubygems
+ * cluster, and it was never about rubygems.
+ *
+ * The type rides in the return value as an opaque int: the tape does not need to know
+ * what VDIR means, only that replay is told what the recording was told.
+ */
+void
+rb_tape_record_realname(const char *path, const char *name, int objtype, int ret, int err)
+{
+    if (!rb_tape_recording()) return;
+    tape_entry *e = entry_begin(RB_TAPE_FS_REALNAME);
+    if (!e) return;
+    entry_iov(e, 0, path, strlen(path));
+    if (ret == 0 && name) entry_iov(e, 1, name, strlen(name));
+    put_result(e, ret, err);
+    put_i64(&e->ret, (int64_t)objtype);
+    entry_commit(e);
+}
+
+int
+rb_tape_replay_realname(const char *path, char *name, size_t cap, int *objtype)
+{
+    const tape_entry *e = tape_next(RB_TAPE_FS_REALNAME);
+    check_path_diverged(e, path);
+
+    int ret = take_result(e);           /* errno restored on failure */
+    if (ret != 0) return ret;
+
+    *objtype = e->ret.len >= 24 ? (int)get_i64(e->ret.ptr + 16) : 0;
+
+    const tape_iov *iov = entry_find_iov(e, 1);
+    if (!iov || iov->bytes.len >= cap) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(name, iov->bytes.ptr, iov->bytes.len);
+    name[iov->bytes.len] = '\0';
+    return 0;
 }
 
 /* ── Effect: readiness ────────────────────────────────────────────────────────

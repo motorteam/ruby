@@ -34,6 +34,7 @@
 
 #include "internal.h"
 #include "ruby/ruby.h"
+#include "internal/vm.h"      /* rb_backtrace_print_as_bugreport, for the divergence report */
 #include "ruby/thread_native.h"
 #include "ruby/version.h"
 #include "tape.h"
@@ -71,6 +72,7 @@ static const char *const tape_effect_fqn[] = {
     "env.get",
     "proc.getpid",
     "fs.mutate",
+    "fs.realpath",
 };
 
 /* Effect signatures, for the Signature column of `--tape-inspect`. Ruby is
@@ -98,6 +100,7 @@ static const char *const tape_effect_sig[] = {
     "([[byte]]) -> [[byte]]",   /* env.get -- gather: name; scatter: value */
     "() -> int",                /* proc.getpid */
     "(op, [[byte]]) -> int",    /* fs.mutate -- gather: the path(s); op names which */
+    "([[byte]]) -> [[byte]]",   /* fs.realpath -- gather: the path; scatter: resolved */
 };
 
 /* ── Allocation ───────────────────────────────────────────────────────────────
@@ -266,11 +269,23 @@ static struct {
 
     /* replay */
     size_t cursor;
-
-    /* Loading the program is not running the program. Nonzero while the loader
-     * is reaching for program text; every chokepoint goes transparent. */
-    int paused;
 } tape;
+
+/*
+ * Nonzero while *this thread* is doing something that is not the program: reaching
+ * for program text (the loader), or asking the clock what deadline to park a condvar
+ * on (the scheduler). Every chokepoint goes transparent for the duration.
+ *
+ * Thread-local, and that is not an optimization. A process-wide counter would mean a
+ * background thread entering the scheduler could switch off recording *for the main
+ * thread*, mid-effect -- silently dropping entries from the tape, which is the one
+ * failure mode we least want and least would notice.
+ */
+#ifdef RB_THREAD_LOCAL_SPECIFIER
+static RB_THREAD_LOCAL_SPECIFIER int tape_paused;
+#else
+static int tape_paused;
+#endif
 
 /*
  * Chokepoints reach this file from GVL-released regions (see tape_realloc), so
@@ -317,8 +332,8 @@ tape_on_vm_thread(void)
            rb_nativethread_self() == tape_vm_thread;
 }
 
-int rb_tape_recording(void) { return tape.recording && !tape.dropped && !tape.paused && !tape_on_vm_thread(); }
-int rb_tape_replaying(void) { return tape.replaying && !tape.paused && !tape_on_vm_thread(); }
+int rb_tape_recording(void) { return tape.recording && !tape.dropped && !tape_paused && !tape_on_vm_thread(); }
+int rb_tape_replaying(void) { return tape.replaying && !tape_paused && !tape_on_vm_thread(); }
 
 /*
  * A `require` reaches the filesystem twice, and only one of the two halves is
@@ -340,8 +355,8 @@ int rb_tape_replaying(void) { return tape.replaying && !tape.paused && !tape_on_
  * behind, ruby.c) is a file the *program* reads, not text the loader consumed, so
  * it stays on the tape.
  */
-void rb_tape_pause(void)   { tape.paused++; }
-void rb_tape_unpause(void) { if (tape.paused > 0) tape.paused--; }
+void rb_tape_pause(void)   { tape_paused++; }
+void rb_tape_unpause(void) { if (tape_paused > 0) tape_paused--; }
 
 /*
  * Whether this process was started with a tape flag -- answered *before*
@@ -435,10 +450,76 @@ entry_iov(tape_entry *e, uint8_t arg_index, const void *p, size_t n)
  * Takes ownership of `e`: its buffers move into the array, and the shell is
  * freed. `e` is dead on return.
  */
+/*
+ * RUBY_TAPE_TRACE=1 -- print every effect as it crosses, to stderr.
+ *
+ * A divergence message names the entry where the two runs parted, which tells you
+ * *that* they parted and nothing about *why*. The why is upstream, usually a long
+ * way upstream, in whatever the program did differently to arrive there. So: trace
+ * the record, trace the replay, and diff them. The first differing line is the real
+ * divergence; the divergence message only reports where the tape finally noticed.
+ *
+ *     RUBY_TAPE_TRACE=1 ruby --tape-record=t.tape prog.rb 2> rec.trace
+ *     RUBY_TAPE_TRACE=1 ruby --tape-replay=t.tape prog.rb 2> rep.trace
+ *     diff rec.trace rep.trace | head
+ */
+static int tape_trace = -1;
+
+static int
+tape_tracing(void)
+{
+    if (tape_trace < 0) {
+        const char *v = getenv("RUBY_TAPE_TRACE");
+        tape_trace = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return tape_trace;
+}
+
+/*
+ * RUBY_TAPE_BREAK=N -- print the Ruby stack at entry N, on either side.
+ *
+ * The divergence report tells you where the *replay* was standing when the tape
+ * caught it. The question that actually cracks a divergence is what the *record*
+ * was doing at the same entry -- the two backtraces, side by side, are the whole
+ * diagnosis. So: break at N under --tape-record, break at N under --tape-replay,
+ * and read them together.
+ */
+static long tape_break = -2;
+
+static void
+tape_trace_line(size_t idx, int func_index, const char *dir)
+{
+    if (tape_break == -2) {
+        const char *v = getenv("RUBY_TAPE_BREAK");
+        tape_break = v && *v ? atol(v) : -1;
+    }
+    if (tape_tracing()) {
+        fprintf(stderr, "[tape-trace] %6zu %s %s\n", idx, dir,
+                func_index < RB_TAPE_EFFECT_MAX ? tape_effect_fqn[func_index] : "?");
+        fflush(stderr);
+    }
+    /* Print the stack and stop. Stopping is not laziness: rb_backtrace_print_as_bugreport
+     * is the *crash* reporter's printer -- it is built to run once, from a signal
+     * handler, on a VM that is about to die, and returning into the interpreter
+     * afterwards wedges it. (Which is why the divergence report gets away with it:
+     * it _exit()s on the next line.) So the breakpoint does the same. You wanted the
+     * backtrace at entry N; here it is, and the run is over. */
+    if (tape_break >= 0 && (size_t)tape_break == idx) {
+        fprintf(stderr, "[tape-break] entry %zu (%s %s) -- the program is here:\n",
+                idx, dir, func_index < RB_TAPE_EFFECT_MAX ? tape_effect_fqn[func_index] : "?");
+        rb_backtrace_print_as_bugreport(stderr);
+        fflush(stderr);
+        _exit(0);
+    }
+}
+
 static void
 entry_commit(tape_entry *e)
 {
     if (!e) return;
+    size_t at = (size_t)-1;
+    int func_index = e->func_index;
+
     rb_nativethread_lock_lock(&tape_lock);
 
     /* Re-check under the lock: another thread may have overrun the ceiling while
@@ -454,6 +535,7 @@ entry_commit(tape_entry *e)
                 tape.entries = tape_realloc(tape.entries, cap * sizeof(tape_entry));
                 tape.cap_entries = cap;
             }
+            at = tape.n_entries;
             tape.entries[tape.n_entries++] = *e;  /* buffers move; no deep copy */
             e->args.ptr = e->ret.ptr = NULL;
             e->iovs = NULL;
@@ -462,6 +544,11 @@ entry_commit(tape_entry *e)
     }
 
     rb_nativethread_lock_unlock(&tape_lock);
+
+    /* Outside the lock, deliberately. The tracer writes to stderr and the breakpoint
+     * walks the VM stack; both can re-enter a chokepoint, and this mutex is not
+     * recursive -- doing it while holding the lock deadlocks the process. */
+    if (at != (size_t)-1) tape_trace_line(at, func_index, "rec");
 
     /* Whatever the outcome, the shell is ours to free -- and if the tape was
      * dropped, so are the buffers it still owns. */
@@ -524,6 +611,18 @@ tape_diverged(const char *fmt, ...)
     vfprintf(stderr, fmt, args);
     va_end(args);
     fputc('\n', stderr);
+
+    /* Where in the *Ruby program* did this happen? The entry index says where the
+     * tape noticed. It says nothing about which line asked for the effect, and that
+     * is the only question anyone actually has.
+     *
+     * rb_backtrace() is no good here: half these chokepoints are reached from inside
+     * rb_nogvl (that is what internal_read_func *is*), and it wants the GVL. The
+     * bug reporter's printer walks the execution context directly -- it is built to
+     * run from a signal handler after a SEGV -- so it works from wherever we are. */
+    fputs("  the program was here:\n", stderr);
+    rb_backtrace_print_as_bugreport(stderr);
+
     fflush(stderr);
     _exit(EXIT_FAILURE);
 }
@@ -544,17 +643,29 @@ tape_next(int func_index)
     rb_nativethread_lock_lock(&tape_lock);
 
     if (tape.cursor >= tape.n_entries) {
+        rb_nativethread_lock_unlock(&tape_lock);
         tape_diverged("ran off the end of the tape at entry %zu; expected no more effects, got %s",
                       tape.cursor, tape_effect_fqn[func_index]);
     }
     const tape_entry *e = &tape.entries[tape.cursor];
     if (e->func_index != func_index) {
+        size_t at = tape.cursor;
+        int recorded = e->func_index;
+        rb_nativethread_lock_unlock(&tape_lock);   /* the report re-enters chokepoints */
         tape_diverged("entry %zu: recorded %s, but the program called %s",
-                      tape.cursor, tape_effect_fqn[e->func_index], tape_effect_fqn[func_index]);
+                      at, tape_effect_fqn[recorded], tape_effect_fqn[func_index]);
     }
-    tape.cursor++;
+    size_t at = tape.cursor++;
 
     rb_nativethread_lock_unlock(&tape_lock);
+
+    /* Outside the lock: the tracer writes and the breakpoint walks the VM stack, and
+     * both can re-enter a chokepoint. This mutex is not recursive.
+     *
+     * The *requested* effect, not the recorded one -- diffing this trace against the
+     * record trace is what shows where the program actually started behaving
+     * differently, which is upstream of wherever the tape happened to notice. */
+    tape_trace_line(at, func_index, "rep");
     return e;
 }
 
@@ -1149,6 +1260,60 @@ rb_tape_ftruncate(int fd, off_t len)
     int ret = ftruncate(fd, len);
     int err = errno;
     fs_mutate_record(RB_TAPE_FS_OP_FTRUNCATE, NULL, NULL, ret, err);
+    errno = err;
+    return ret;
+}
+
+/*
+ * realpath(3).
+ *
+ * `File.realpath` does not walk the path with lstat on the happy path -- it hands
+ * the whole string to libc, and libc does its stats *inside libc*, where nothing in
+ * this tree can see them. So a successful File.realpath put nothing at all on the
+ * tape, and looked for all the world like a pure function.
+ *
+ * It stayed invisible until replay stopped creating directories for real. Then the
+ * recorded run's realpath succeeded silently, the replayed run's failed with ENOENT
+ * -- the directory had never been made -- CRuby fell back to its own lstat-walking
+ * emulation (rb_check_realpath_emulate), and the extra stats desynced the tape. The
+ * symptom was 147 test files diverging on `clock.realtime` versus `fs.stat`, which
+ * points nowhere near here.
+ *
+ * On replay it resolves nothing: it hands back the string libc resolved when the
+ * tape was cut.
+ */
+char *
+rb_tape_realpath(const char *path, char *resolved)
+{
+    if (rb_tape_replaying()) {
+        const tape_entry *e = tape_next(RB_TAPE_FS_REALPATH);
+        check_path_diverged(e, path);
+        int ret = take_result(e);
+        if (ret != 0) return NULL;      /* errno restored by take_result */
+
+        const tape_iov *iov = entry_find_iov(e, 1);
+        if (!iov) return NULL;
+        /* realpath(3) returns its own malloc'd buffer when handed NULL, and the
+         * caller frees it -- so a replayed result has to be malloc'd too, not a
+         * pointer into the tape. */
+        char *out = resolved ? resolved : tape_malloc(iov->bytes.len + 1);
+        memcpy(out, iov->bytes.ptr, iov->bytes.len);
+        out[iov->bytes.len] = '\0';
+        return out;
+    }
+
+    char *ret = realpath(path, resolved);
+    int err = errno;
+
+    if (rb_tape_recording()) {
+        tape_entry *e = entry_begin(RB_TAPE_FS_REALPATH);
+        if (e) {
+            entry_iov(e, 0, path, strlen(path));
+            if (ret) entry_iov(e, 1, ret, strlen(ret));
+            put_result(e, ret ? 0 : -1, err);
+            entry_commit(e);
+        }
+    }
     errno = err;
     return ret;
 }

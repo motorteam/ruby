@@ -5046,7 +5046,10 @@ rb_check_realpath_internal(VALUE basedir, VALUE path, rb_encoding *origenc, enum
     }
     if (origenc) unresolved_path = TO_OSPATH(unresolved_path);
 
-    if ((resolved_ptr = realpath(RSTRING_PTR(unresolved_path), resolved_buffer)) == NULL) {
+    /* Through the tape: libc resolves this one entirely inside itself, so a
+     * successful realpath leaves no trace at any other chokepoint. See
+     * rb_tape_realpath. */
+    if ((resolved_ptr = rb_tape_realpath(RSTRING_PTR(unresolved_path), resolved_buffer)) == NULL) {
         /*
            wasi-libc 22 and later support realpath(3) but return ENOTSUP
            when the underlying host syscall returns it.

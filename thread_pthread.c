@@ -264,15 +264,35 @@ native_cond_timedwait(rb_nativethread_cond_t *cond, pthread_mutex_t *mutex, cons
 static rb_hrtime_t
 native_cond_timeout(rb_nativethread_cond_t *cond, const rb_hrtime_t rel)
 {
+    /* Off the tape: this is a deadline for pthread_cond_timedwait, not the program
+     * asking for the time. The value never reaches Ruby -- it decides only how long
+     * this thread parks on a condvar -- and *how often we get here at all* depends on
+     * how the threads happen to contend, which is to say on nothing the program can
+     * control. Taped, it sprayed clock reads through the effect stream at points that
+     * moved from run to run: a tape would record `fs.stat, clock.realtime` and the
+     * next run would produce `clock.realtime, fs.stat`, and 147 test files diverged on
+     * exactly that, in both directions.
+     *
+     * Same rule as the timer thread (rb_tape_thread_off): an effect belongs on the
+     * tape when the *program* asked for it. The scheduler asking itself what time it
+     * is does not qualify.
+     *
+     * The clocks the program *does* see stay taped -- sleep_hrtime's own deadline
+     * loop (thread.c) and Process.clock_gettime -- so a replayed sleep still ends
+     * after exactly the number of turns it took when recorded. */
+    rb_tape_pause();
+    rb_hrtime_t abs;
     if (condattr_monotonic) {
-        return rb_hrtime_add(rb_hrtime_now(), rel);
+        abs = rb_hrtime_add(rb_hrtime_now(), rel);
     }
     else {
         struct timespec ts;
 
         rb_timespec_now(&ts);
-        return rb_hrtime_add(rb_timespec2hrtime(&ts), rel);
+        abs = rb_hrtime_add(rb_timespec2hrtime(&ts), rel);
     }
+    rb_tape_unpause();
+    return abs;
 }
 
 void

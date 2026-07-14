@@ -69,6 +69,17 @@ enum rb_tape_effect {
      * And replay does the same thing with every one of them: serve the recorded
      * result and touch nothing. See rb_tape_fs_op. */
     RB_TAPE_FS_MUTATE       = 19,
+    /* libc's realpath(3). `File.realpath` does not walk the path with lstat on the
+     * happy path -- it hands the whole thing to libc, which does its stats *inside
+     * libc*, where no chokepoint in this tree can see them. So a successful
+     * File.realpath put **nothing at all** on the tape.
+     *
+     * That was invisible until replay stopped creating directories for real. Then:
+     * the recorded run's realpath succeeded silently, the replayed run's failed with
+     * ENOENT (the directory was never made), CRuby fell back to its own lstat-walking
+     * emulation, and the extra stats desynced the tape. The fifth time this tree has
+     * taught the same lesson -- the funnel is never where you think. */
+    RB_TAPE_FS_REALPATH     = 20,
     RB_TAPE_EFFECT_MAX
 };
 
@@ -274,6 +285,14 @@ int rb_tape_fstat(int fd, struct stat *st);
 int rb_tape_stat(const char *path, struct stat *st);
 int rb_tape_lstat(const char *path, struct stat *st);
 off_t rb_tape_lseek(int fd, off_t offset, int whence);
+
+/**
+ * realpath(3), taped. A drop-in: same signature, same semantics, errno included.
+ * On replay it resolves nothing -- it hands back the path libc resolved when the
+ * tape was cut, so a replayed program can realpath a directory that no longer
+ * exists (and, more to the point, one that replay deliberately never created).
+ */
+char *rb_tape_realpath(const char *path, char *resolved);
 
 /* The filesystem mutations. Drop-ins, like the rest: same signature, same
  * semantics, errno included. On replay they touch nothing and serve the recorded

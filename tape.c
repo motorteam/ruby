@@ -64,11 +64,12 @@ static const char *const tape_effect_fqn[] = {
     "fs.lstat",
     "fs.fstat",
     "fs.isatty",
-    "(13: unused)",
+    "fs.lseek",
     "fs.opendir",
     "fs.readdir",
     "fs.closedir",
     "env.get",
+    "proc.getpid",
 };
 
 /* Effect signatures, for the Signature column of `--tape-inspect`. Ruby is
@@ -89,11 +90,12 @@ static const char *const tape_effect_sig[] = {
     "([[byte]], [[byte]]) -> int", /* fs.lstat */
     "(int, [[byte]]) -> int",   /* fs.fstat  -- scatter: struct stat */
     "(int) -> bool",            /* fs.isatty */
-    "",                         /* 13 -- unused in the Ruby port */
+    "(int, int, int) -> int",   /* fs.lseek -- (fd, whence, offset) -> position */
     "([[byte]]) -> int",        /* fs.opendir -- gather: the path */
     "() -> [[byte]]",           /* fs.readdir -- scatter: the entry name */
     "() -> int",                /* fs.closedir */
     "([[byte]]) -> [[byte]]",   /* env.get -- gather: name; scatter: value */
+    "() -> int",                /* proc.getpid */
 };
 
 /* ── Allocation ───────────────────────────────────────────────────────────────
@@ -495,19 +497,34 @@ entry_find_iov(const tape_entry *e, uint8_t arg_index)
 /* ── Effect: clocks ───────────────────────────────────────────────────────── */
 
 void
-rb_tape_record_clock(int effect, const struct timespec *ts)
+rb_tape_record_clock(int effect, int clock_id, const struct timespec *ts)
 {
     tape_entry *e = entry_begin(effect);
     if (!e) return;
+    put_u32(&e->args, (uint32_t)clock_id);
     put_i64(&e->ret, (int64_t)ts->tv_sec);
     put_i64(&e->ret, (int64_t)ts->tv_nsec);
     entry_commit(e);
 }
 
 void
-rb_tape_replay_clock(int effect, struct timespec *ts)
+rb_tape_replay_clock(int effect, int clock_id, struct timespec *ts)
 {
     const tape_entry *e = tape_next(effect);
+
+    /* Every clock but CLOCK_REALTIME shares one func_index, so the id is what
+     * separates a monotonic read from a CPU-time read. A program that asks for a
+     * different clock than the one recorded has diverged, and serving it the
+     * wrong clock's value would be exactly the silent wrongness we exist to
+     * prevent. */
+    if (e->args.len >= 4) {
+        int recorded = (int)get_u32(e->args.ptr);
+        if (recorded != clock_id) {
+            tape_diverged("entry %zu: recorded a read of clock %d, but the program read clock %d",
+                          tape.cursor - 1, recorded, clock_id);
+        }
+    }
+
     ts->tv_sec = (time_t)get_i64(e->ret.ptr);
     ts->tv_nsec = (long)get_i64(e->ret.ptr + 8);
 }
@@ -575,6 +592,39 @@ take_io_result(const tape_entry *e)
     return ret;
 }
 
+/*
+ * The fd and the buffer size the program presents have to match what was
+ * recorded. They are on the tape as args precisely so they can be checked, and
+ * they were not being checked.
+ *
+ * The consequence was not a missed divergence -- it was a *crash instead of* a
+ * divergence. A program that had already gone off the rails would ask for a
+ * 1024-byte read, be handed back the recorded return of a 16598-byte one, and
+ * CRuby would die inside rb_str_set_len with
+ *
+ *     [BUG] probable buffer overflow: 16598 for 1024
+ *
+ * which says nothing about tapes at all. Crashing is not diverging. Say what
+ * actually happened, at the entry where it happened.
+ */
+static void
+check_io_args_diverged(const tape_entry *e, const char *what, int fd, size_t capa)
+{
+    if (e->args.len < 8) return;
+    int rec_fd = (int)get_u32(e->args.ptr);
+    size_t rec_capa = (size_t)get_u32(e->args.ptr + 4);
+
+    if (rec_fd != fd) {
+        tape_diverged("entry %zu: recorded a %s on fd %d, but the program used fd %d",
+                      tape.cursor - 1, what, rec_fd, fd);
+    }
+    if (rec_capa != capa) {
+        tape_diverged("entry %zu: recorded a %s of %zu bytes on fd %d, "
+                      "but the program asked for %zu",
+                      tape.cursor - 1, what, rec_capa, fd, capa);
+    }
+}
+
 void
 rb_tape_record_read(int fd, const void *buf, size_t capa, ssize_t ret, int err)
 {
@@ -592,6 +642,7 @@ ssize_t
 rb_tape_replay_read(int fd, void *buf, size_t capa)
 {
     const tape_entry *e = tape_next(RB_TAPE_IO_READ);
+    check_io_args_diverged(e, "read", fd, capa);
     ssize_t ret = take_io_result(e);
     const tape_iov *iov = entry_find_iov(e, 1);
     if (iov && ret > 0) {
@@ -894,6 +945,52 @@ int rb_tape_stat(const char *path, struct stat *st)  { return tape_stat(RB_TAPE_
 int rb_tape_lstat(const char *path, struct stat *st) { return tape_stat(RB_TAPE_FS_LSTAT, path, -1, st, call_lstat); }
 int rb_tape_fstat(int fd, struct stat *st)           { return tape_stat(RB_TAPE_FS_FSTAT, NULL, fd, st, call_fstat); }
 
+/*
+ * The file position.
+ *
+ * This one hides. `File.read` does not just read -- it sizes its buffer first,
+ * from `st_size - lseek(fd, 0, SEEK_CUR)` (remain_size, io.c). With the fstat on
+ * the tape and the lseek off it, replay asked the *fake* fd where it was, got -1
+ * back, and fell through to a 1024-byte default. The read that followed no longer
+ * matched the read on the tape, and every File.read in the language was affected.
+ *
+ * The position is also observable directly, through IO#pos and IO#seek.
+ */
+off_t
+rb_tape_lseek(int fd, off_t offset, int whence)
+{
+    if (rb_tape_replaying()) {
+        const tape_entry *e = tape_next(RB_TAPE_FS_LSEEK);
+        if (e->args.len >= 4) {
+            int rec_fd = (int)get_u32(e->args.ptr);
+            if (rec_fd != fd) {
+                tape_diverged("entry %zu: recorded a seek on fd %d, but the program seeked fd %d",
+                              tape.cursor - 1, rec_fd, fd);
+            }
+        }
+        off_t ret = (off_t)get_i64(e->ret.ptr);
+        if (ret < 0 && e->ret.len >= 16) errno = (int)get_i64(e->ret.ptr + 8);
+        return ret;
+    }
+
+    off_t ret = lseek(fd, offset, whence);
+    int err = errno;
+
+    if (rb_tape_recording()) {
+        tape_entry *e = entry_begin(RB_TAPE_FS_LSEEK);
+        if (e) {
+            put_u32(&e->args, (uint32_t)fd);
+            put_u32(&e->args, (uint32_t)whence);
+            put_i64(&e->args, (int64_t)offset);
+            put_i64(&e->ret, (int64_t)ret);
+            put_i64(&e->ret, (int64_t)(ret < 0 ? err : 0));
+            entry_commit(e);
+        }
+    }
+    errno = err;
+    return ret;
+}
+
 /* ── Effect: directory iteration ──────────────────────────────────────────── */
 
 #include <dirent.h>
@@ -997,6 +1094,28 @@ rb_tape_closedir(DIR *dirp)
     }
     errno = err;
     return ret;
+}
+
+/* ── Effect: the process ──────────────────────────────────────────────────── */
+
+long
+rb_tape_getpid(void)
+{
+    if (rb_tape_replaying()) {
+        const tape_entry *e = tape_next(RB_TAPE_PROC_GETPID);
+        return (long)get_i64(e->ret.ptr);
+    }
+
+    long pid = (long)getpid();
+
+    if (rb_tape_recording()) {
+        tape_entry *e = entry_begin(RB_TAPE_PROC_GETPID);
+        if (e) {
+            put_i64(&e->ret, (int64_t)pid);
+            entry_commit(e);
+        }
+    }
+    return pid;
 }
 
 /* ── Effect: the environment ──────────────────────────────────────────────── */

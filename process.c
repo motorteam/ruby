@@ -98,6 +98,7 @@ int initgroups(const char *, rb_gid_t);
 #include "dln.h"
 #include "hrtime.h"
 #include "internal.h"
+#include "tape.h"
 #include "internal/bits.h"
 #include "internal/dir.h"
 #include "internal/error.h"
@@ -502,7 +503,7 @@ static VALUE
 get_pid(void)
 {
     if (UNLIKELY(!cached_pid)) { /* 0 is not a valid pid */
-        cached_pid = getpid();
+        cached_pid = (rb_pid_t)rb_tape_getpid();
     }
     /* pid should be likely POSFIXABLE() */
     return PIDT2NUM(cached_pid);
@@ -8422,7 +8423,20 @@ rb_clock_gettime(int argc, VALUE *argv, VALUE _)
         struct timespec ts;
         c = NUM2CLOCKID(clk_id);
       gettime:
-        ret = clock_gettime(c, &ts);
+        /* Process.clock_gettime -- the one clock read the program names itself.
+         * Every clockid funnels through here, so the id goes on the tape beside
+         * the value and replay checks it: asking for a different clock than was
+         * recorded is a divergence, not something to serve a wrong answer to. */
+        if (rb_tape_replaying()) {
+            rb_tape_replay_clock(rb_tape_clock_effect((int)c), (int)c, &ts);
+            ret = 0;
+        }
+        else {
+            ret = clock_gettime(c, &ts);
+            if (ret == 0 && rb_tape_recording()) {
+                rb_tape_record_clock(rb_tape_clock_effect((int)c), (int)c, &ts);
+            }
+        }
         if (ret == -1)
             clock_failed("gettime", errno, clk_id);
         tt.count = (int32_t)ts.tv_nsec;

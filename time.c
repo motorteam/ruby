@@ -2022,7 +2022,7 @@ void
 rb_timespec_now(struct timespec *ts)
 {
     if (rb_tape_replaying()) {
-        rb_tape_replay_clock(RB_TAPE_CLOCK_REALTIME, ts);
+        rb_tape_replay_clock(RB_TAPE_CLOCK_REALTIME, RB_TAPE_CLOCKID_REALTIME, ts);
         return;
     }
 #ifdef HAVE_CLOCK_GETTIME
@@ -2040,7 +2040,7 @@ rb_timespec_now(struct timespec *ts)
     }
 #endif
     if (rb_tape_recording()) {
-        rb_tape_record_clock(RB_TAPE_CLOCK_REALTIME, ts);
+        rb_tape_record_clock(RB_TAPE_CLOCK_REALTIME, RB_TAPE_CLOCKID_REALTIME, ts);
     }
 }
 

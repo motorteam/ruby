@@ -46,7 +46,12 @@ enum rb_tape_effect {
      * (io.c:8619), so an unrecorded isatty silently ties a tape to whether it
      * was recorded under a terminal or a pipe. */
     RB_TAPE_FS_ISATTY       = 12,
-    /* 13 is fs.lseek in the Python port; Ruby does not hook it yet. */
+    /* The file position. Not a curiosity either: `File.read` sizes its buffer
+     * from `st_size - lseek(fd, 0, SEEK_CUR)` (remain_size, io.c). With the fstat
+     * taped and the lseek not, replay asked the *fake* fd where it was, got -1,
+     * and fell back to a 1024-byte default -- so the read no longer matched the
+     * one on the tape. Every File.read was affected. */
+    RB_TAPE_FS_LSEEK        = 13,
     RB_TAPE_FS_OPENDIR      = 14,
     RB_TAPE_FS_READDIR      = 15,
     RB_TAPE_FS_CLOSEDIR     = 16,
@@ -54,6 +59,10 @@ enum rb_tape_effect {
      * snapshots it into a dict at startup -- so this is a per-read effect rather
      * than the one-shot snapshot the Python port records. */
     RB_TAPE_ENV_GET         = 17,
+    /* The pid is read once and cached, so it costs one entry -- but it leaks into
+     * ordinary output (`$$`, the test runner's own banner) and into temp-file
+     * names, so an unrecorded pid diverges on the *bytes* and on the *paths*. */
+    RB_TAPE_PROC_GETPID     = 18,
     RB_TAPE_EFFECT_MAX
 };
 
@@ -113,8 +122,54 @@ void rb_tape_unpause(void);
  * call site stays two or three lines and the marshalling lives here.
  */
 
-void rb_tape_record_clock(int effect, const struct timespec *ts);
-void rb_tape_replay_clock(int effect, struct timespec *ts);
+/**
+ * Clocks. `clock_id` is the platform clockid the program actually asked for; it
+ * rides in args so replay can check it and so `--tape-inspect` can name it.
+ *
+ * A taped clock and an untaped clock in the same loop is a *divergent loop*, and
+ * that is not a hypothetical: `sleep` computes its pthread_cond_timedwait
+ * deadline from the realtime clock (native_cond_timeout, thread_pthread.c) and
+ * then tests for completion against the monotonic one (sleep_hrtime, thread.c).
+ * With realtime taped and monotonic live, replay froze the deadline in the past
+ * -- so the wait returned instantly, the monotonic clock said "not yet", and the
+ * loop spun, burning one tape entry per turn until it ran off the end. Both
+ * clocks have to move together, and they only do that if both are on the tape.
+ *
+ * The payoff beyond correctness: a program that sleeps ten seconds replays
+ * instantly, because time advances on the tape rather than on the wall.
+ */
+void rb_tape_record_clock(int effect, int clock_id, const struct timespec *ts);
+void rb_tape_replay_clock(int effect, int clock_id, struct timespec *ts);
+
+/* The clockid names for the two clocks CRuby reads without being told one.
+ * `rb_timespec_now` may reach the wall clock through gettimeofday on a platform
+ * with no clock_gettime, and gettimeofday has no clockid at all -- so name one,
+ * and keep the ids on the tape stable whichever path the build takes. */
+#ifdef CLOCK_REALTIME
+# define RB_TAPE_CLOCKID_REALTIME CLOCK_REALTIME
+#else
+# define RB_TAPE_CLOCKID_REALTIME 0
+#endif
+#ifdef CLOCK_MONOTONIC
+# define RB_TAPE_CLOCKID_MONOTONIC CLOCK_MONOTONIC
+#else
+# define RB_TAPE_CLOCKID_MONOTONIC 1
+#endif
+
+/**
+ * Which effect a clockid belongs to. CLOCK_REALTIME is the wall clock; every
+ * other clock -- MONOTONIC, PROCESS_CPUTIME_ID, THREAD_CPUTIME_ID, the BSD
+ * variants -- is a monotonic-family read and shares one func_index, with the
+ * exact id recorded in args to tell them apart.
+ */
+static inline int
+rb_tape_clock_effect(int clock_id)
+{
+#ifdef CLOCK_REALTIME
+    if (clock_id == CLOCK_REALTIME) return RB_TAPE_CLOCK_REALTIME;
+#endif
+    return RB_TAPE_CLOCK_MONOTONIC;
+}
 
 void rb_tape_record_random(const void *buf, size_t len, int ret);
 int  rb_tape_replay_random(void *buf, size_t len);
@@ -153,6 +208,7 @@ int rb_tape_isatty(int fd);
 int rb_tape_fstat(int fd, struct stat *st);
 int rb_tape_stat(const char *path, struct stat *st);
 int rb_tape_lstat(const char *path, struct stat *st);
+off_t rb_tape_lseek(int fd, off_t offset, int whence);
 
 /**
  * `open` is the exception to the drop-in shape. `rb_cloexec_open` runs fcntl
@@ -201,6 +257,9 @@ int rb_tape_closedir(DIR *dirp);
 
 /** ENV. Returns the recorded value on replay; NULL for an unset variable. */
 const char *rb_tape_getenv(const char *name);
+
+/** getpid, taped. `long` rather than rb_pid_t so this header stays free of ruby.h. */
+long rb_tape_getpid(void);
 
 /**
  * Make the std streams' TTY-ness match the tape. Defined in io.c (it needs

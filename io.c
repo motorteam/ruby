@@ -661,7 +661,7 @@ io_unread(rb_io_t *fptr, bool discard_rbuf)
 
     errno = 0;
     if (!rb_w32_fd_is_text(fptr->fd)) {
-        r = lseek(fptr->fd, -fptr->rbuf.len, SEEK_CUR);
+        r = rb_tape_lseek(fptr->fd, -fptr->rbuf.len, SEEK_CUR);
         if (r < 0 && errno) {
             if (errno == ESPIPE)
                 fptr->mode |= FMODE_DUPLEX;
@@ -671,7 +671,7 @@ io_unread(rb_io_t *fptr, bool discard_rbuf)
         goto end;
     }
 
-    pos = lseek(fptr->fd, 0, SEEK_CUR);
+    pos = rb_tape_lseek(fptr->fd, 0, SEEK_CUR);
     if (pos < 0 && errno) {
         if (errno == ESPIPE)
             fptr->mode |= FMODE_DUPLEX;
@@ -695,7 +695,7 @@ io_unread(rb_io_t *fptr, bool discard_rbuf)
 
     buf = ALLOC_N(char, fptr->rbuf.len + newlines);
     while (newlines >= 0) {
-        r = lseek(fptr->fd, pos - fptr->rbuf.len - newlines, SEEK_SET);
+        r = rb_tape_lseek(fptr->fd, pos - fptr->rbuf.len - newlines, SEEK_SET);
         if (newlines == 0) break;
         if (r < 0) {
             newlines--;
@@ -708,7 +708,7 @@ io_unread(rb_io_t *fptr, bool discard_rbuf)
             rb_syserr_fail_path(e, fptr->pathv);
         }
         if (read_size == fptr->rbuf.len) {
-            lseek(fptr->fd, r, SEEK_SET);
+            rb_tape_lseek(fptr->fd, r, SEEK_SET);
             break;
         }
         else {
@@ -942,7 +942,7 @@ io_unread(rb_io_t *fptr, bool discard_rbuf)
         return;
     /* xxx: target position may be negative if buffer is filled by ungetc */
     errno = 0;
-    r = lseek(fptr->fd, -fptr->rbuf.len, SEEK_CUR);
+    r = rb_tape_lseek(fptr->fd, -fptr->rbuf.len, SEEK_CUR);
     if (r < 0 && errno) {
         if (errno == ESPIPE)
             fptr->mode |= FMODE_DUPLEX;
@@ -1000,8 +1000,8 @@ flush_before_seek(rb_io_t *fptr, bool discard_rbuf)
     return fptr;
 }
 
-#define io_seek(fptr, ofs, whence) (errno = 0, lseek(flush_before_seek(fptr, true)->fd, (ofs), (whence)))
-#define io_tell(fptr) lseek(flush_before_seek(fptr, false)->fd, 0, SEEK_CUR)
+#define io_seek(fptr, ofs, whence) (errno = 0, rb_tape_lseek(flush_before_seek(fptr, true)->fd, (ofs), (whence)))
+#define io_tell(fptr) rb_tape_lseek(flush_before_seek(fptr, false)->fd, 0, SEEK_CUR)
 
 #ifndef SEEK_CUR
 # define SEEK_SET 0
@@ -3253,7 +3253,7 @@ remain_size(rb_io_t *fptr)
     {
         if (io_fflush(fptr) < 0)
             rb_sys_fail_on_write(fptr);
-        pos = lseek(fptr->fd, 0, SEEK_CUR);
+        pos = rb_tape_lseek(fptr->fd, 0, SEEK_CUR);
         if (st.st_size >= pos && pos >= 0) {
             siz += st.st_size - pos;
             if (siz > LONG_MAX) {
@@ -6181,7 +6181,7 @@ rb_io_sysseek(int argc, VALUE *argv, VALUE io)
         rb_warn("sysseek for buffered IO");
     }
     errno = 0;
-    pos = lseek(fptr->fd, pos, whence);
+    pos = rb_tape_lseek(fptr->fd, pos, whence);
     if (pos < 0 && errno) rb_sys_fail_path(fptr->pathv);
 
     return OFFT2NUM(pos);
@@ -12870,7 +12870,7 @@ nogvl_copy_file_range(struct copy_stream_struct *stp)
         if (src_offset < (rb_off_t)0) {
             rb_off_t current_offset;
             errno = 0;
-            current_offset = lseek(stp->src_fptr->fd, 0, SEEK_CUR);
+            current_offset = rb_tape_lseek(stp->src_fptr->fd, 0, SEEK_CUR);
             if (current_offset < (rb_off_t)0 && errno) {
                 stp->syserr = "lseek";
                 stp->error_no = errno;
@@ -12959,13 +12959,13 @@ nogvl_fcopyfile(struct copy_stream_struct *stp)
 
     if (!S_ISREG(stp->dst_stat.st_mode))
         return 0;
-    if (lseek(stp->dst_fptr->fd, 0, SEEK_CUR) > (rb_off_t)0) /* if dst IO was already written */
+    if (rb_tape_lseek(stp->dst_fptr->fd, 0, SEEK_CUR) > (rb_off_t)0) /* if dst IO was already written */
         return 0;
     if (fcntl(stp->dst_fptr->fd, F_GETFL) & O_APPEND) {
         /* fcopyfile(3) appends src IO to dst IO and then truncates
          * dst IO to src IO's original size. */
-        rb_off_t end = lseek(stp->dst_fptr->fd, 0, SEEK_END);
-        lseek(stp->dst_fptr->fd, 0, SEEK_SET);
+        rb_off_t end = rb_tape_lseek(stp->dst_fptr->fd, 0, SEEK_END);
+        rb_tape_lseek(stp->dst_fptr->fd, 0, SEEK_SET);
         if (end > (rb_off_t)0) return 0;
     }
 
@@ -12974,14 +12974,14 @@ nogvl_fcopyfile(struct copy_stream_struct *stp)
 
         /* get current offset */
         errno = 0;
-        cur = lseek(stp->src_fptr->fd, 0, SEEK_CUR);
+        cur = rb_tape_lseek(stp->src_fptr->fd, 0, SEEK_CUR);
         if (cur < (rb_off_t)0 && errno) {
             stp->error_no = errno;
             return 1;
         }
 
         errno = 0;
-        r = lseek(stp->src_fptr->fd, src_offset, SEEK_SET);
+        r = rb_tape_lseek(stp->src_fptr->fd, src_offset, SEEK_SET);
         if (r < (rb_off_t)0 && errno) {
             stp->error_no = errno;
             return 1;
@@ -12998,7 +12998,7 @@ nogvl_fcopyfile(struct copy_stream_struct *stp)
             rb_off_t r;
             errno = 0;
             /* reset offset */
-            r = lseek(stp->src_fptr->fd, cur, SEEK_SET);
+            r = rb_tape_lseek(stp->src_fptr->fd, cur, SEEK_SET);
             if (r < (rb_off_t)0 && errno) {
                 stp->error_no = errno;
                 return 1;
@@ -13045,7 +13045,7 @@ static ssize_t
 simple_sendfile(int out_fd, int in_fd, rb_off_t *offset, rb_off_t count)
 {
     int r;
-    rb_off_t pos = offset ? *offset : lseek(in_fd, 0, SEEK_CUR);
+    rb_off_t pos = offset ? *offset : rb_tape_lseek(in_fd, 0, SEEK_CUR);
     rb_off_t sbytes;
 #  ifdef __APPLE__
     r = sendfile(in_fd, out_fd, pos, &count, NULL, 0);
@@ -13058,7 +13058,7 @@ simple_sendfile(int out_fd, int in_fd, rb_off_t *offset, rb_off_t count)
         *offset += sbytes;
     }
     else {
-        lseek(in_fd, sbytes, SEEK_CUR);
+        rb_tape_lseek(in_fd, sbytes, SEEK_CUR);
     }
     return (ssize_t)sbytes;
 }
@@ -13096,7 +13096,7 @@ nogvl_copy_stream_sendfile(struct copy_stream_struct *stp)
         else {
             rb_off_t cur;
             errno = 0;
-            cur = lseek(stp->src_fptr->fd, 0, SEEK_CUR);
+            cur = rb_tape_lseek(stp->src_fptr->fd, 0, SEEK_CUR);
             if (cur < (rb_off_t)0 && errno) {
                 stp->syserr = "lseek";
                 stp->error_no = errno;
@@ -13264,7 +13264,7 @@ nogvl_copy_stream_read_write(struct copy_stream_struct *stp)
     if (use_pread && stp->close_src) {
         rb_off_t r;
         errno = 0;
-        r = lseek(stp->src_fptr->fd, src_offset, SEEK_SET);
+        r = rb_tape_lseek(stp->src_fptr->fd, src_offset, SEEK_SET);
         if (r < (rb_off_t)0 && errno) {
             stp->syserr = "lseek";
             stp->error_no = errno;

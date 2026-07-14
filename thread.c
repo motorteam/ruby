@@ -75,6 +75,7 @@
 #include "eval_intern.h"
 #include "hrtime.h"
 #include "internal.h"
+#include "tape.h"
 #include "internal/class.h"
 #include "internal/cont.h"
 #include "internal/error.h"
@@ -1319,14 +1320,40 @@ thread_value(VALUE self)
  * Thread Scheduling
  */
 
+/*
+ * The monotonic clock -- and therefore every sleep, every timeout, and every
+ * stopwatch in the language. It has to be on the tape for the same reason the
+ * wall clock does, but also for a sharper one: it shares a loop with the wall
+ * clock. `sleep_hrtime` (below) computes its deadline through native_cond_timeout,
+ * which reads the *realtime* clock, and then tests for completion here, against
+ * the *monotonic* one. Tape only one of the two and replay freezes the deadline
+ * in the past while the live clock says "not yet" -- and sleep spins forever.
+ */
 static void
 getclockofday(struct timespec *ts)
 {
-#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
-    if (clock_gettime(CLOCK_MONOTONIC, ts) == 0)
+    if (rb_tape_replaying()) {
+        rb_tape_replay_clock(RB_TAPE_CLOCK_MONOTONIC, RB_TAPE_CLOCKID_MONOTONIC, ts);
         return;
+    }
+
+    int got = 0;
+#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
+    got = (clock_gettime(CLOCK_MONOTONIC, ts) == 0);
 #endif
-    rb_timespec_now(ts);
+    if (!got) {
+        /* No monotonic clock on this platform: CRuby falls back to wall time.
+         * rb_timespec_now is itself a chokepoint, so pause across it -- this read
+         * must land on the tape as the clock.monotonic the caller asked for, not
+         * as a second clock.realtime. */
+        rb_tape_pause();
+        rb_timespec_now(ts);
+        rb_tape_unpause();
+    }
+
+    if (rb_tape_recording()) {
+        rb_tape_record_clock(RB_TAPE_CLOCK_MONOTONIC, RB_TAPE_CLOCKID_MONOTONIC, ts);
+    }
 }
 
 /*

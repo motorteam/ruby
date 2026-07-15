@@ -94,22 +94,16 @@ enum rb_tape_effect {
      * changes, carrying the new thread's serial.
      *
      * A tape is one linear log, and two threads doing IO at once append to it in
-     * whatever order they happen to finish. Nothing is wrong with that as a
-     * *recording* -- it is exactly what happened -- but replaying it as a single
-     * sequence demands that the two threads interleave identically the second time,
-     * which nothing guarantees and which the scheduler will not oblige.
-     * `EnvUtil.invoke_ruby` reads a subprocess's stdout and stderr in two concurrent
-     * threads, and 41 test files diverged on nothing but which of the two got there
-     * first.
+     * whatever order they finish -- a truthful recording, but not one that replays as
+     * a single sequence, because the second run will not interleave them the same way.
+     * The tape is instead cut into one stream per *resource* (see tape_stream in
+     * tape.c): same-resource effects stay ordered, disjoint ones float. The markers are
+     * how the decoder knows which thread performed each effect, so that effects with no
+     * shared host object of their own -- a clock read, an ENV lookup -- are keyed to
+     * the performing thread rather than falsely ordered against another thread's.
      *
-     * So the markers cut the linear tape into **per-thread subsequences**. On replay
-     * each thread walks its own, and the order *between* threads is left free -- a
-     * partial order, which is all a GVL'd program can honestly promise anyway: within
-     * a thread, effects are totally ordered and must replay exactly; across threads,
-     * only the effects themselves are determined, not their interleaving.
-     *
-     * The marker rides on the effect table rather than in the entry struct, so the
-     * wire format stays Watt's, byte for byte.
+     * The marker rides on the effect table rather than in the entry struct, so the wire
+     * format stays Watt's, byte for byte.
      */
     RB_TAPE_VM_THREAD       = 24,
     /**

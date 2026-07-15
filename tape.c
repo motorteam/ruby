@@ -282,21 +282,41 @@ typedef struct {
 } tape_entry;
 
 /**
- * One thread's slice of the tape: the indices of the entries it performed, in the
- * order it performed them, and how far along it is on replay.
+ * One *resource's* slice of the tape: the indices of the effects performed on it, in
+ * the order they were performed, and how far along replay is.
  *
  * A tape is one linear log, and two threads doing IO at once append to it in whatever
- * order they finish. That is a truthful *recording*. It is not a replayable one: to
- * replay it as a single sequence, the two threads would have to interleave identically
- * the second time, and nothing makes them. So the vm.thread markers cut the log back
- * into per-thread streams, and each thread replays its own.
+ * order they finish -- a truthful recording, but not one that replays as a single
+ * sequence, because the second run will not interleave the threads the same way. The
+ * fix is not to force the interleaving (the physical schedule is not reproducible: a
+ * blocking read releases the GVL and comes back on the kernel's clock, not the
+ * program's). It is to notice that two effects only need to be ordered when they act on
+ * the same *thing*.
  *
- * Within a thread, effects are totally ordered and must match exactly. Across threads,
- * the interleaving is left free. That is the honest promise: a partial order.
+ * So the log is cut into one stream per resource:
+ *
+ *   - a file descriptor -- two writes to fd 1 are ordered (that is what makes "foobar"
+ *     replay as "foobar" and not "barfoo"); writes to different fds are independent, so
+ *     `EnvUtil.invoke_ruby`'s two reader threads, draining two different pipes, never
+ *     contend;
+ *   - a path -- `stat("/a")` and `stat("/b")` are independent; two opens of the same
+ *     path are ordered;
+ *   - the entropy stream (one shared sequence);
+ *   - and, for everything a thread does that touches no shared host object -- reading
+ *     the clock, reading ENV, iterating its own directory -- the *thread itself* is the
+ *     resource, which recovers program order without ordering across threads.
+ *
+ * This is Octet's per-object ordering (Bond et al., PPPJ '15) mapped onto host
+ * resources: order same-resource accesses, let disjoint ones float. It is a partial
+ * order like the old per-thread one, but a *sound* one -- the old design asserted
+ * nothing between threads and so could not tell "foobar" from "barfoo"; this orders
+ * exactly the pairs that share a resource. What it still cannot see is two threads
+ * racing on shared *Ruby* memory with no host effect between them -- which is a data
+ * race, and a bug, and the same blind spot the paper accepts for un-instrumented code.
  */
 typedef struct {
-    uint32_t thread;
-    size_t *idx;      /* indices into tape.entries, in this thread's order */
+    uint64_t key;     /* the resource: a tagged fd / path-hash / thread / singleton */
+    size_t *idx;      /* indices into tape.entries, in this resource's order */
     size_t n, cap;
     size_t cursor;    /* replay position within idx */
 } tape_stream;
@@ -314,11 +334,36 @@ static struct {
     int dropped;
     uint32_t last_thread;   /* the thread the last entry came from */
 
-    /* replay: the tape, re-cut into one stream per thread */
+    /* replay: the tape, re-cut into one stream per resource */
     tape_stream *streams;
     size_t n_streams;
 
 } tape;
+
+/* A resource key: a 2-bit tag over a 62-bit value, so fd 1, the thread with serial 1,
+ * and the path that happens to hash to 1 never collide. */
+#define RKEY_TAG_SINGLE  (0ULL << 62)   /* one global resource, e.g. the entropy stream */
+#define RKEY_TAG_THREAD  (1ULL << 62)   /* effects with no shared host object */
+#define RKEY_TAG_FD      (2ULL << 62)   /* a file descriptor */
+#define RKEY_TAG_PATH    (3ULL << 62)   /* a filesystem path */
+#define RKEY_MASK        ((1ULL << 62) - 1)
+
+#define RKEY_THREAD(t)   (RKEY_TAG_THREAD | ((uint64_t)(t) & RKEY_MASK))
+#define RKEY_FD(fd)      (RKEY_TAG_FD     | ((uint64_t)(uint32_t)(fd) & RKEY_MASK))
+#define RKEY_SINGLE(c)   (RKEY_TAG_SINGLE | ((uint64_t)(c) & RKEY_MASK))
+enum { RKEY_SINGLE_RANDOM = 1 };
+
+/* FNV-1a over the path bytes, folded into 62 bits. The same bytes are hashed at the
+ * call site (the C string) and at decode (the recorded gather iov), so the two agree. */
+static uint64_t
+rkey_path(const void *p, size_t n)
+{
+    uint64_t h = 1469598103934665603ULL;
+    const unsigned char *b = p;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ULL; }
+    return RKEY_TAG_PATH | (h & RKEY_MASK);
+}
+#define RKEY_PATH(s)     rkey_path((s), strlen(s))
 
 /*
  * Nonzero while *this thread* is doing something that is not the program: reaching
@@ -755,47 +800,42 @@ tape_diverged(const char *fmt, ...)
 
 /** This thread's stream, or NULL if the recording never saw this thread. */
 static tape_stream *
-tape_stream_for(uint32_t thread)
+tape_stream_for(uint64_t key)
 {
     for (size_t i = 0; i < tape.n_streams; i++) {
-        if (tape.streams[i].thread == thread) return &tape.streams[i];
+        if (tape.streams[i].key == key) return &tape.streams[i];
     }
     return NULL;
 }
 
 /**
- * The next entry *this thread* recorded.
+ * The next entry recorded on a given *resource*.
  *
- * The tape is one log, but it replays as one stream per thread. Within a thread the
- * effects are totally ordered and must match exactly -- a func_index mismatch is the
- * divergence check, as in Watt. *Between* threads nothing is asserted, because nothing
- * can be: two threads that both did IO during the recording appended in whatever order
- * they finished, and demanding the same order again would be demanding that the
- * scheduler repeat itself.
+ * Within a resource, effects are totally ordered and must match exactly -- a
+ * func_index mismatch is the divergence check, as in Watt. *Across* resources nothing
+ * is asserted, because nothing needs to be: effects on different fds, different paths,
+ * or different threads' private state have no dependency, and demanding an order
+ * between them would be demanding the scheduler repeat itself. See tape_stream.
  */
 static const tape_entry *
-tape_next(int func_index)
+tape_next_key(int func_index, uint64_t key)
 {
-    uint32_t tid = tape_current_thread();
-
     /* Replay is reached from GVL-released regions too, so the cursors are shared
      * mutable state under exactly the same conditions as the recorder's array. The
      * entries themselves are immutable once decoded, so only the bump needs guarding
      * -- and tape_diverged never returns, so the lock dies with us. */
     rb_nativethread_lock_lock(&tape_lock);
 
-    tape_stream *s = tape_stream_for(tid);
+    tape_stream *s = tape_stream_for(key);
     if (!s) {
         rb_nativethread_lock_unlock(&tape_lock);
-        tape_diverged("thread %u performed %s, but no thread with that serial did "
-                      "anything at all when the tape was cut",
-                      tid, tape_effect_fqn[func_index]);
+        tape_diverged("the program performed %s on a resource the recording never "
+                      "touched", tape_effect_fqn[func_index]);
     }
     if (s->cursor >= s->n) {
         rb_nativethread_lock_unlock(&tape_lock);
-        tape_diverged("thread %u ran off the end of its %zu recorded effects; "
-                      "expected no more, got %s",
-                      tid, s->n, tape_effect_fqn[func_index]);
+        tape_diverged("the program ran off the end of a resource's %zu recorded "
+                      "effects; expected no more, got %s", s->n, tape_effect_fqn[func_index]);
     }
 
     size_t at = s->idx[s->cursor];
@@ -812,14 +852,13 @@ tape_next(int func_index)
         if (func_index == RB_TAPE_IO_WRITE && tape_pending_write) {
             tape_buf show = { 0 };
             excerpt(&show, tape_pending_write, tape_pending_write_len, 0);
-            tape_diverged("entry %zu (thread %u): recorded %s, but the program wrote "
-                          "%zu bytes: %s",
-                          at, tid, tape_effect_fqn[recorded],
+            tape_diverged("entry %zu: recorded %s, but the program wrote %zu bytes: %s",
+                          at, tape_effect_fqn[recorded],
                           tape_pending_write_len, (const char *)show.ptr);
         }
 
-        tape_diverged("entry %zu (thread %u): recorded %s, but the program called %s",
-                      at, tid, tape_effect_fqn[recorded], tape_effect_fqn[func_index]);
+        tape_diverged("entry %zu: recorded %s, but the program called %s",
+                      at, tape_effect_fqn[recorded], tape_effect_fqn[func_index]);
     }
     s->cursor++;
     tape_last_at = at;
@@ -827,13 +866,19 @@ tape_next(int func_index)
     rb_nativethread_lock_unlock(&tape_lock);
 
     /* Outside the lock: the tracer writes and the breakpoint walks the VM stack, and
-     * both can re-enter a chokepoint. This mutex is not recursive.
-     *
-     * The *requested* effect, not the recorded one -- diffing this trace against the
-     * record trace is what shows where the program actually started behaving
-     * differently, which is upstream of wherever the tape happened to notice. */
+     * both can re-enter a chokepoint. This mutex is not recursive. */
     tape_trace_line(at, func_index, "rep");
     return e;
+}
+
+/* The default resource is the calling thread -- for every effect that touches no
+ * shared host object (the clock, ENV, a private directory handle, the pid). This is
+ * exactly the old per-thread stream, kept for those effects; the fd- and path-keyed
+ * variants below are what add cross-thread ordering where it is actually needed. */
+static const tape_entry *
+tape_next(int func_index)
+{
+    return tape_next_key(func_index, RKEY_THREAD(tape_current_thread()));
 }
 
 /** The bytes captured for `arg_index`, or NULL if that arg had no iov. */
@@ -898,7 +943,7 @@ rb_tape_record_random(const void *buf, size_t len, int ret)
 int
 rb_tape_replay_random(void *buf, size_t len)
 {
-    const tape_entry *e = tape_next(RB_TAPE_RANDOM_BYTES);
+    const tape_entry *e = tape_next_key(RB_TAPE_RANDOM_BYTES, RKEY_SINGLE(RKEY_SINGLE_RANDOM));
     const tape_iov *iov = entry_find_iov(e, 0);
     if (iov) {
         size_t n = iov->bytes.len < len ? iov->bytes.len : len;
@@ -993,7 +1038,7 @@ rb_tape_record_read(int fd, const void *buf, size_t capa, ssize_t ret, int err)
 ssize_t
 rb_tape_replay_read(int fd, void *buf, size_t capa)
 {
-    const tape_entry *e = tape_next(RB_TAPE_IO_READ);
+    const tape_entry *e = tape_next_key(RB_TAPE_IO_READ, RKEY_FD(fd));
     check_io_args_diverged(e, "read", fd, capa);
     ssize_t ret = take_io_result(e);
     const tape_iov *iov = entry_find_iov(e, 1);
@@ -1120,7 +1165,7 @@ ssize_t
 rb_tape_replay_write(int fd, const void *buf, size_t capa)
 {
     tape_pending_write = buf; tape_pending_write_len = capa;
-    const tape_entry *e = tape_next(RB_TAPE_IO_WRITE);
+    const tape_entry *e = tape_next_key(RB_TAPE_IO_WRITE, RKEY_FD(fd));
     tape_pending_write = NULL;
     check_write_diverged(e, buf, capa);
     tape_echo_write(fd, buf, capa);
@@ -1167,7 +1212,7 @@ rb_tape_replay_writev(int fd, const struct iovec *iov, int iovcnt)
     /* The first iovec is enough to name the code; the report only needs a hint. */
     tape_pending_write = iovcnt ? iov[0].iov_base : NULL;
     tape_pending_write_len = iovcnt ? iov[0].iov_len : 0;
-    const tape_entry *e = tape_next(RB_TAPE_IO_WRITE);
+    const tape_entry *e = tape_next_key(RB_TAPE_IO_WRITE, RKEY_FD(fd));
     tape_pending_write = NULL;
 
     /* Flatten the presented iovecs so they can be compared against the recorded
@@ -1246,7 +1291,7 @@ rb_tape_record_open(const char *path, int flags, int fd, int err)
 int
 rb_tape_replay_open(const char *path)
 {
-    const tape_entry *e = tape_next(RB_TAPE_FS_OPEN);
+    const tape_entry *e = tape_next_key(RB_TAPE_FS_OPEN, RKEY_PATH(path));
     check_path_diverged(e, path);
     return take_result(e);
 }
@@ -1255,7 +1300,7 @@ int
 rb_tape_close(int fd)
 {
     if (rb_tape_replaying()) {
-        return take_result(tape_next(RB_TAPE_FS_CLOSE));
+        return take_result(tape_next_key(RB_TAPE_FS_CLOSE, RKEY_FD(fd)));
     }
 
     int ret = close(fd);
@@ -1279,7 +1324,9 @@ tape_stat(int effect, const char *path, int fd, struct stat *st,
           int (*call)(const char *, int, struct stat *))
 {
     if (rb_tape_replaying()) {
-        const tape_entry *e = tape_next(effect);
+        /* stat/lstat name a path; fstat names an fd -- so the resource is one or the
+         * other, matching how the entry was recorded (iov path vs args fd). */
+        const tape_entry *e = tape_next_key(effect, path ? RKEY_PATH(path) : RKEY_FD(fd));
         if (path) check_path_diverged(e, path);
         const tape_iov *iov = entry_find_iov(e, 1);
         if (iov && iov->bytes.len == sizeof(*st)) memcpy(st, iov->bytes.ptr, sizeof(*st));
@@ -1312,7 +1359,7 @@ int
 rb_tape_isatty(int fd)
 {
     if (rb_tape_replaying()) {
-        return take_result(tape_next(RB_TAPE_FS_ISATTY));
+        return take_result(tape_next_key(RB_TAPE_FS_ISATTY, RKEY_FD(fd)));
     }
 
     int ret = isatty(fd);
@@ -1359,7 +1406,7 @@ static const char *const tape_fs_op_name[] = {
 static int
 fs_mutate_replay(int op, const char *a, const char *b)
 {
-    const tape_entry *e = tape_next(RB_TAPE_FS_MUTATE);
+    const tape_entry *e = tape_next_key(RB_TAPE_FS_MUTATE, a ? RKEY_PATH(a) : RKEY_THREAD(tape_current_thread()));
 
     if (e->args.len >= 4) {
         int rec_op = (int)get_u32(e->args.ptr);
@@ -1522,7 +1569,7 @@ int
 rb_tape_access(const char *path, int mode, int effective, int (*call)(const char *, int))
 {
     if (rb_tape_replaying()) {
-        const tape_entry *e = tape_next(RB_TAPE_FS_ACCESS);
+        const tape_entry *e = tape_next_key(RB_TAPE_FS_ACCESS, RKEY_PATH(path));
         check_path_diverged(e, path);
         return take_result(e);
     }
@@ -1548,7 +1595,7 @@ ssize_t
 rb_tape_readlink(const char *path, char *buf, size_t size)
 {
     if (rb_tape_replaying()) {
-        const tape_entry *e = tape_next(RB_TAPE_FS_READLINK);
+        const tape_entry *e = tape_next_key(RB_TAPE_FS_READLINK, RKEY_PATH(path));
         check_path_diverged(e, path);
         ssize_t ret = (ssize_t)get_i64(e->ret.ptr);
         if (ret < 0) {
@@ -1603,7 +1650,7 @@ char *
 rb_tape_realpath(const char *path, char *resolved)
 {
     if (rb_tape_replaying()) {
-        const tape_entry *e = tape_next(RB_TAPE_FS_REALPATH);
+        const tape_entry *e = tape_next_key(RB_TAPE_FS_REALPATH, RKEY_PATH(path));
         check_path_diverged(e, path);
         int ret = take_result(e);
         if (ret != 0) return NULL;      /* errno restored by take_result */
@@ -1650,7 +1697,7 @@ off_t
 rb_tape_lseek(int fd, off_t offset, int whence)
 {
     if (rb_tape_replaying()) {
-        const tape_entry *e = tape_next(RB_TAPE_FS_LSEEK);
+        const tape_entry *e = tape_next_key(RB_TAPE_FS_LSEEK, RKEY_FD(fd));
         if (e->args.len >= 4) {
             int rec_fd = (int)get_u32(e->args.ptr);
             if (rec_fd != fd) {
@@ -1874,7 +1921,7 @@ rb_tape_program_text_p(const char *path)
 int
 rb_tape_replay_loadok(const char *path)
 {
-    const tape_entry *e = tape_next(RB_TAPE_FS_LOADOK);
+    const tape_entry *e = tape_next_key(RB_TAPE_FS_LOADOK, RKEY_PATH(path));
     check_path_diverged(e, path);
     return take_result(e);
 }
@@ -1893,7 +1940,7 @@ rb_tape_record_loadok(const char *path, int ok)
 const unsigned char *
 rb_tape_replay_loadfile(const char *path, size_t *len)
 {
-    const tape_entry *e = tape_next(RB_TAPE_FS_LOADFILE);
+    const tape_entry *e = tape_next_key(RB_TAPE_FS_LOADFILE, RKEY_PATH(path));
     check_path_diverged(e, path);
     *len = 0;
     if (take_result(e) != 0) return NULL;      /* the recording could not read it either */
@@ -1948,7 +1995,7 @@ rb_tape_record_realname(const char *path, const char *name, int objtype, int ret
 int
 rb_tape_replay_realname(const char *path, char *name, size_t cap, int *objtype)
 {
-    const tape_entry *e = tape_next(RB_TAPE_FS_REALNAME);
+    const tape_entry *e = tape_next_key(RB_TAPE_FS_REALNAME, RKEY_PATH(path));
     check_path_diverged(e, path);
 
     int ret = take_result(e);           /* errno restored on failure */
@@ -2121,7 +2168,7 @@ int
 rb_tape_fcntl(int fd, int cmd)
 {
     if (rb_tape_replaying()) {
-        const tape_entry *e = tape_next(RB_TAPE_FS_FCNTL);
+        const tape_entry *e = tape_next_key(RB_TAPE_FS_FCNTL, RKEY_FD(fd));
         return take_result(e);
     }
 
@@ -2448,14 +2495,54 @@ tape_read_file(const char *path)
 }
 
 /**
- * Cut the linear tape back into one stream per thread.
+ * The resource an entry acts on -- computed to match exactly what the replay call site
+ * passes to tape_next_key, so the two agree on which stream this effect belongs to.
+ * `cur_thread` is the thread in force here (tracked from the vm.thread markers), used
+ * for every effect that has no shared host object of its own.
+ */
+static uint64_t
+entry_resource_key(const tape_entry *e, uint32_t cur_thread)
+{
+    switch (e->func_index) {
+      /* fd is the first u32 of args for all of these. */
+      case RB_TAPE_IO_READ:  case RB_TAPE_IO_WRITE:
+      case RB_TAPE_FS_CLOSE: case RB_TAPE_FS_ISATTY:
+      case RB_TAPE_FS_LSEEK: case RB_TAPE_FS_FCNTL:
+        return RKEY_FD(e->args.len >= 4 ? get_u32(e->args.ptr) : (uint32_t)-1);
+
+      /* fstat is fd-keyed (args), stat/lstat path-keyed (iov 0). */
+      case RB_TAPE_FS_FSTAT: {
+        const tape_iov *iov = entry_find_iov(e, 0);
+        if (iov) return rkey_path(iov->bytes.ptr, iov->bytes.len);   /* shouldn't happen */
+        return RKEY_FD(e->args.len >= 4 ? get_u32(e->args.ptr) : (uint32_t)-1);
+      }
+
+      /* path is gather iov 0 for all of these. */
+      case RB_TAPE_FS_OPEN:   case RB_TAPE_FS_STAT:     case RB_TAPE_FS_LSTAT:
+      case RB_TAPE_FS_REALPATH: case RB_TAPE_FS_ACCESS: case RB_TAPE_FS_READLINK:
+      case RB_TAPE_FS_REALNAME: case RB_TAPE_FS_LOADOK: case RB_TAPE_FS_LOADFILE:
+      case RB_TAPE_FS_MUTATE: {
+        const tape_iov *iov = entry_find_iov(e, 0);
+        if (iov) return rkey_path(iov->bytes.ptr, iov->bytes.len);
+        return RKEY_THREAD(cur_thread);   /* fd-based mutation (fchmod/ftruncate): no path */
+      }
+
+      case RB_TAPE_RANDOM_BYTES:
+        return RKEY_SINGLE(RKEY_SINGLE_RANDOM);
+
+      /* Everything else -- clock, ENV, the pid, a private directory handle, select,
+       * pipe, spawn/waitpid, the terminal entry -- is the thread's own. */
+      default:
+        return RKEY_THREAD(cur_thread);
+    }
+}
+
+/**
+ * Cut the linear tape into one stream per resource (see tape_stream).
  *
- * The vm.thread markers are the seams: each one says who performed everything that
- * follows it, until the next. So walk the log once, attributing each entry to the
- * thread in force, and hand every thread the list of *its* entries in *its* order.
- *
- * The markers themselves are not effects and are not put in any stream -- nothing will
- * ever ask for one.
+ * Walk the log once, tracking the current thread from the vm.thread markers, and hand
+ * each effect to its resource's stream in recorded order. The markers themselves are
+ * not effects and go into no stream -- nothing ever asks for one.
  */
 static void
 tape_cut_into_streams(void)
@@ -2470,13 +2557,14 @@ tape_cut_into_streams(void)
             continue;
         }
 
-        tape_stream *s = tape_stream_for(cur);
+        uint64_t key = entry_resource_key(e, cur);
+        tape_stream *s = tape_stream_for(key);
         if (!s) {
             tape.streams = tape_realloc(tape.streams,
                                         (tape.n_streams + 1) * sizeof(tape_stream));
             s = &tape.streams[tape.n_streams++];
             memset(s, 0, sizeof(*s));
-            s->thread = cur;
+            s->key = key;
         }
         if (s->n == s->cap) {
             s->cap = s->cap ? s->cap * 2 : 64;
@@ -2749,11 +2837,11 @@ rb_tape_finish(int exit_status)
                           (long long)recorded, exit_status);
         }
 
-        /* Every thread has to have walked its whole stream. A thread that stopped
-         * short performed fewer effects than it recorded -- it diverged, and merely
-         * did not live long enough to be told so. Counting per stream is what catches
-         * that: a global count would let one thread's overrun hide another's shortfall.
-         */
+        /* Every resource has to have been walked to its end. A stream left short means
+         * the program performed fewer effects on that resource than it recorded -- it
+         * diverged, and merely did not live long enough to be told so. Counting per
+         * stream is what catches that: a global count would let one resource's overrun
+         * hide another's shortfall. */
         size_t served = 0, total = 0;
         for (size_t i = 0; i < tape.n_streams; i++) {
             served += tape.streams[i].cursor;
@@ -2763,16 +2851,9 @@ rb_tape_finish(int exit_status)
         if (served != total) {
             rb_warn("tape: replay stopped %zu effects short of the %zu recorded; "
                     "the program diverged", total - served, total);
-            for (size_t i = 0; i < tape.n_streams; i++) {
-                const tape_stream *s = &tape.streams[i];
-                if (s->cursor != s->n) {
-                    rb_warn("tape:   thread %u replayed %zu of its %zu effects",
-                            s->thread, s->cursor, s->n);
-                }
-            }
         }
         else if (tape.n_streams > 1) {
-            fprintf(stderr, "[tape] replayed %zu entries across %zu threads, no divergence\n",
+            fprintf(stderr, "[tape] replayed %zu entries across %zu resources, no divergence\n",
                     tape.n_entries, tape.n_streams);
         }
         else {

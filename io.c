@@ -8537,9 +8537,15 @@ io_reopen(VALUE io, VALUE nfile)
         rb_thread_io_close_interrupt(fptr);
         rb_thread_io_close_wait(fptr);
 
+        /* On replay the dup2 is a no-op: the fds are the recording's, not the kernel's,
+         * so redirecting one onto another means nothing -- and reads and writes are
+         * served by fd *number*, which reopen leaves unchanged, so wherever fd really
+         * points is invisible. Recording still dup2s for real; only the syscall is
+         * skipped, the bookkeeping below is not. (mkmf reopens $stderr onto its log; the
+         * log's fd was never opened for real here, so a real dup2 would fail EBADF.) */
         if (RUBY_IO_EXTERNAL_P(fptr) || fd <= 2 || !fptr->stdio_file) {
             /* need to keep FILE objects of stdin, stdout and stderr */
-            if (rb_cloexec_dup2(fd2, fd) < 0)
+            if (!rb_tape_replaying() && rb_cloexec_dup2(fd2, fd) < 0)
                 rb_sys_fail_path(orig->pathv);
             rb_update_max_fd(fd);
         }
@@ -8547,7 +8553,7 @@ io_reopen(VALUE io, VALUE nfile)
             fclose(fptr->stdio_file);
             fptr->stdio_file = 0;
             fptr->fd = -1;
-            if (rb_cloexec_dup2(fd2, fd) < 0)
+            if (!rb_tape_replaying() && rb_cloexec_dup2(fd2, fd) < 0)
                 rb_sys_fail_path(orig->pathv);
             rb_update_max_fd(fd);
             fptr->fd = fd;
@@ -13474,7 +13480,7 @@ copy_stream_body(VALUE arg)
         RB_IO_POINTER(src_io, stp->src_fptr);
         rb_io_check_byte_readable(stp->src_fptr);
 
-        stat_ret = fstat(stp->src_fptr->fd, &stp->src_stat);
+        stat_ret = rb_tape_fstat(stp->src_fptr->fd, &stp->src_stat);
         if (stat_ret < 0) {
             stp->syserr = "fstat";
             stp->error_no = errno;
@@ -13511,7 +13517,7 @@ copy_stream_body(VALUE arg)
         RB_IO_POINTER(dst_io, stp->dst_fptr);
         rb_io_check_writable(stp->dst_fptr);
 
-        stat_ret = fstat(stp->dst_fptr->fd, &stp->dst_stat);
+        stat_ret = rb_tape_fstat(stp->dst_fptr->fd, &stp->dst_stat);
         if (stat_ret < 0) {
             stp->syserr = "fstat";
             stp->error_no = errno;
@@ -13555,6 +13561,14 @@ copy_stream_body(VALUE arg)
         return Qnil;
 
     if (stp->src_fptr == NULL || stp->dst_fptr == NULL) {
+        return copy_stream_fallback(stp);
+    }
+
+    /* sendfile/copy_file_range move the bytes kernel-to-kernel, past both the read and
+     * the write chokepoint -- so under a tape the copy would leave no trace to record and
+     * nothing to replay, and the raw fstats above would fail on a replayed fd. The
+     * read/write fallback goes through the hooked IO path, so the copy rides the tape. */
+    if (rb_tape_recording() || rb_tape_replaying()) {
         return copy_stream_fallback(stp);
     }
 

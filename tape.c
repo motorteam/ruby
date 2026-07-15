@@ -340,20 +340,29 @@ static struct {
 
 } tape;
 
-/* A resource key: a 2-bit tag over a 62-bit value, so fd 1, the thread with serial 1,
- * and the path that happens to hash to 1 never collide. */
-#define RKEY_TAG_SINGLE  (0ULL << 62)   /* one global resource, e.g. the entropy stream */
-#define RKEY_TAG_THREAD  (1ULL << 62)   /* effects with no shared host object */
-#define RKEY_TAG_FD      (2ULL << 62)   /* a file descriptor */
-#define RKEY_TAG_PATH    (3ULL << 62)   /* a filesystem path */
-#define RKEY_MASK        ((1ULL << 62) - 1)
+/* A resource key: a 3-bit tag over a 61-bit value, so fd 1, the thread with serial 1,
+ * and the path that happens to hash to 1 never collide. An fd carries *two* resources:
+ * its data (bytes and offset, strictly ordered) and its lifecycle (open/close/queries).
+ * They get separate tags so a close never has to wait behind a read on another thread. */
+#define RKEY_TAG_SINGLE  (0ULL << 61)   /* one global resource, e.g. the entropy stream */
+#define RKEY_TAG_THREAD  (1ULL << 61)   /* effects with no shared host object */
+#define RKEY_TAG_FD      (2ULL << 61)   /* a file descriptor's data (read/write/lseek) */
+#define RKEY_TAG_PATH    (3ULL << 61)   /* a filesystem path */
+#define RKEY_TAG_FDLIFE  (4ULL << 61)   /* a file descriptor's lifecycle/queries */
+#define RKEY_MASK        ((1ULL << 61) - 1)
 
 #define RKEY_THREAD(t)   (RKEY_TAG_THREAD | ((uint64_t)(t) & RKEY_MASK))
 #define RKEY_FD(fd)      (RKEY_TAG_FD     | ((uint64_t)(uint32_t)(fd) & RKEY_MASK))
+/* Lifecycle is keyed by fd *and* op: a close and an fstat on one fd carry no order
+ * between them (close returns 0/EBADF, fstat's size is recorded, isatty is immutable),
+ * only successive ops of the same kind do -- two fstats as a file grows. Folding the op
+ * into the key gives each kind its own stream, so a close never waits behind an fstat. */
+#define RKEY_FDLIFE(fd, fn) \
+    (RKEY_TAG_FDLIFE | ((((uint64_t)(uint32_t)(fd) << 6) | ((fn) & 63)) & RKEY_MASK))
 #define RKEY_SINGLE(c)   (RKEY_TAG_SINGLE | ((uint64_t)(c) & RKEY_MASK))
 enum { RKEY_SINGLE_RANDOM = 1 };
 
-/* FNV-1a over the path bytes, folded into 62 bits. The same bytes are hashed at the
+/* FNV-1a over the path bytes, folded into 61 bits. The same bytes are hashed at the
  * call site (the C string) and at decode (the recorded gather iov), so the two agree. */
 static uint64_t
 rkey_path(const void *p, size_t n)
@@ -1300,7 +1309,7 @@ int
 rb_tape_close(int fd)
 {
     if (rb_tape_replaying()) {
-        return take_result(tape_next_key(RB_TAPE_FS_CLOSE, RKEY_FD(fd)));
+        return take_result(tape_next_key(RB_TAPE_FS_CLOSE, RKEY_FDLIFE(fd, RB_TAPE_FS_CLOSE)));
     }
 
     int ret = close(fd);
@@ -1324,9 +1333,11 @@ tape_stat(int effect, const char *path, int fd, struct stat *st,
           int (*call)(const char *, int, struct stat *))
 {
     if (rb_tape_replaying()) {
-        /* stat/lstat name a path; fstat names an fd -- so the resource is one or the
-         * other, matching how the entry was recorded (iov path vs args fd). */
-        const tape_entry *e = tape_next_key(effect, path ? RKEY_PATH(path) : RKEY_FD(fd));
+        /* stat/lstat name a path, so they order on it. fstat only *queries* an fd -- it
+         * moves no offset and reads no bytes -- so it goes on the fd's lifecycle stream,
+         * ordered against close and other queries but not against reads on another thread. */
+        const tape_entry *e = tape_next_key(effect,
+            path ? RKEY_PATH(path) : RKEY_FDLIFE(fd, effect));
         if (path) check_path_diverged(e, path);
         const tape_iov *iov = entry_find_iov(e, 1);
         if (iov && iov->bytes.len == sizeof(*st)) memcpy(st, iov->bytes.ptr, sizeof(*st));
@@ -1359,7 +1370,7 @@ int
 rb_tape_isatty(int fd)
 {
     if (rb_tape_replaying()) {
-        return take_result(tape_next_key(RB_TAPE_FS_ISATTY, RKEY_FD(fd)));
+        return take_result(tape_next_key(RB_TAPE_FS_ISATTY, RKEY_FDLIFE(fd, RB_TAPE_FS_ISATTY)));
     }
 
     int ret = isatty(fd);
@@ -2168,7 +2179,7 @@ int
 rb_tape_fcntl(int fd, int cmd)
 {
     if (rb_tape_replaying()) {
-        const tape_entry *e = tape_next_key(RB_TAPE_FS_FCNTL, RKEY_FD(fd));
+        const tape_entry *e = tape_next_key(RB_TAPE_FS_FCNTL, RKEY_FDLIFE(fd, RB_TAPE_FS_FCNTL));
         return take_result(e);
     }
 
@@ -2504,17 +2515,30 @@ static uint64_t
 entry_resource_key(const tape_entry *e, uint32_t cur_thread)
 {
     switch (e->func_index) {
-      /* fd is the first u32 of args for all of these. */
-      case RB_TAPE_IO_READ:  case RB_TAPE_IO_WRITE:
-      case RB_TAPE_FS_CLOSE: case RB_TAPE_FS_ISATTY:
-      case RB_TAPE_FS_LSEEK: case RB_TAPE_FS_FCNTL:
+      /* Only the effects that carry bytes or move the file offset are ordered on the fd's
+       * *data* stream: two threads reading or writing one fd have a real, observable order,
+       * and an lseek reorders every read and write after it. fd is the first u32 of args. */
+      case RB_TAPE_IO_READ:  case RB_TAPE_IO_WRITE:  case RB_TAPE_FS_LSEEK:
         return RKEY_FD(e->args.len >= 4 ? get_u32(e->args.ptr) : (uint32_t)-1);
 
-      /* fstat is fd-keyed (args), stat/lstat path-keyed (iov 0). */
+      /* close, isatty, fcntl and fstat are the fd's *lifecycle and queries*: none reads or
+       * writes a byte or moves the offset, so their position relative to a read on another
+       * thread is not observable. Ordering them on the data stream only forced a cross-thread
+       * order the replay scheduler never reproduces -- the reader thread had not run yet when
+       * the owner closed the fd -- and turned every such close into a false divergence. They
+       * get the fd's separate lifecycle stream, ordered among themselves (a size-changing
+       * fstat, a reopen) but independent of the bytes. The one constraint they do carry, "the
+       * fd is valid until closed," is already enforced by each read and write's own recorded
+       * result: a read after the close recorded EBADF. */
+      case RB_TAPE_FS_CLOSE: case RB_TAPE_FS_ISATTY: case RB_TAPE_FS_FCNTL:
+        return RKEY_FDLIFE(e->args.len >= 4 ? get_u32(e->args.ptr) : (uint32_t)-1,
+                           e->func_index);
+
       case RB_TAPE_FS_FSTAT: {
         const tape_iov *iov = entry_find_iov(e, 0);
         if (iov) return rkey_path(iov->bytes.ptr, iov->bytes.len);   /* shouldn't happen */
-        return RKEY_FD(e->args.len >= 4 ? get_u32(e->args.ptr) : (uint32_t)-1);
+        return RKEY_FDLIFE(e->args.len >= 4 ? get_u32(e->args.ptr) : (uint32_t)-1,
+                           e->func_index);
       }
 
       /* path is gather iov 0 for all of these. */

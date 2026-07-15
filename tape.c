@@ -38,6 +38,7 @@
 #include "internal/vm.h"      /* rb_backtrace_print_as_bugreport, for the divergence report */
 #include "ruby/thread_native.h"
 #include "ruby/version.h"
+#include "ruby/debug.h"       /* rb_tracepoint_*, rb_tracearg_raised_exception -- RB_TAPE_WHY */
 #include "tape.h"
 #include "vm_core.h"
 
@@ -772,6 +773,52 @@ get_i64(const uint8_t *p)
 
 /* ── Replayer ─────────────────────────────────────────────────────────────── */
 
+/*
+ * Why a test raised on replay, when the divergence is three frames removed from it.
+ *
+ * A test that passes at record and fails at replay takes its framework's rescue path --
+ * which was never recorded, so the first effect it makes (reading the clock to time the
+ * failure) diverges. By then `$!` has been cleared and the assertion that actually failed
+ * is invisible. So we catch the exception where it is still live: at the raise itself.
+ *
+ * Installed only under RB_TAPE_WHY, since a global RAISE hook slows every method return.
+ * The exception rides the trace arg (not errinfo, which is nil at hook time); its message
+ * is read straight off the `mesg` ivar rather than through #message, which would allocate
+ * and re-enter Ruby from inside the hook. tape_diverged prints the last one raised, plus
+ * how many effects were served since -- zero means the divergence is that raise's shadow,
+ * a large gap means the exception is an earlier one the program caught and moved past.
+ */
+static char     tape_last_raise[512];
+static int      tape_last_raise_set;
+static uint64_t tape_serve_count;    /* effects successfully served so far */
+static uint64_t tape_last_raise_at;  /* tape_serve_count when the last raise fired */
+
+static void
+tape_raise_tp(VALUE tpval, void *data)
+{
+    (void)data;
+    rb_trace_arg_t *arg = rb_tracearg_from_tracepoint(tpval);
+    VALUE exc = rb_tracearg_raised_exception(arg);   /* on the trace arg, not errinfo */
+    if (NIL_P(exc)) return;
+    tape_last_raise_at = tape_serve_count;
+    const char *cname = rb_obj_classname(exc);
+    static ID id_mesg;
+    if (!id_mesg) id_mesg = rb_intern("mesg");
+    VALUE mesg = rb_attr_get(exc, id_mesg);   /* read the ivar, don't call #message */
+    VALUE path = rb_tracearg_path(arg);
+    int line = FIX2INT(rb_tracearg_lineno(arg));
+    const char *where = RB_TYPE_P(path, T_STRING) ? RSTRING_PTR(path) : "?";
+    char msg[300] = "";
+    if (RB_TYPE_P(mesg, T_STRING)) {
+        int n = (int)RSTRING_LEN(mesg);
+        if (n > 240) n = 240;
+        snprintf(msg, sizeof(msg), ": %.*s", n, RSTRING_PTR(mesg));
+    }
+    snprintf(tape_last_raise, sizeof(tape_last_raise), "%s%s   [raised at %s:%d]",
+             cname, msg, where, line);
+    tape_last_raise_set = 1;
+}
+
 /**
  * Report a divergence and stop.
  *
@@ -802,6 +849,14 @@ tape_diverged(const char *fmt, ...)
      * run from a signal handler after a SEGV -- so it works from wherever we are. */
     fputs("  the program was here:\n", stderr);
     rb_backtrace_print_as_bugreport(stderr);
+
+    if (tape_last_raise_set) {
+        uint64_t gap = tape_serve_count - tape_last_raise_at;
+        fprintf(stderr, "  ...most recent exception raised on replay: %s\n", tape_last_raise);
+        fprintf(stderr, "     (%llu effects served since it was raised%s)\n",
+                (unsigned long long)gap,
+                gap == 0 ? " -- this is almost certainly the cause" : "");
+    }
 
     fflush(stderr);
     _exit(EXIT_FAILURE);
@@ -870,6 +925,7 @@ tape_next_key(int func_index, uint64_t key)
                       at, tape_effect_fqn[recorded], tape_effect_fqn[func_index]);
     }
     s->cursor++;
+    tape_serve_count++;
     tape_last_at = at;
 
     rb_nativethread_lock_unlock(&tape_lock);
@@ -2842,6 +2898,11 @@ rb_tape_replay_from(const char *path)
     tape.replaying = 1;
     tape.path = tape_strdup(path);
     tape_read_file(path);
+    if (getenv("RB_TAPE_WHY")) {
+        VALUE tp = rb_tracepoint_new(Qnil, RUBY_EVENT_RAISE, tape_raise_tp, NULL);
+        rb_gc_register_mark_object(tp);   /* created once, lives for the run */
+        rb_tracepoint_enable(tp);
+    }
 }
 
 void

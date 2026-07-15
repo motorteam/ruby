@@ -90,7 +90,7 @@ rsock_sendto_blocking(void *data)
     struct rsock_send_arg *arg = data;
     VALUE mesg = arg->mesg;
     ssize_t ret;
-    do_write_retry(sendto(arg->fd, RSTRING_PTR(mesg), RSTRING_LEN(mesg),
+    do_write_retry(rb_tape_sendto(arg->fd, RSTRING_PTR(mesg), RSTRING_LEN(mesg),
                           arg->flags, arg->to, arg->tolen));
     return (VALUE)ret;
 }
@@ -101,7 +101,7 @@ rsock_send_blocking(void *data)
     struct rsock_send_arg *arg = data;
     VALUE mesg = arg->mesg;
     ssize_t ret;
-    do_write_retry(send(arg->fd, RSTRING_PTR(mesg), RSTRING_LEN(mesg),
+    do_write_retry(rb_tape_send(arg->fd, RSTRING_PTR(mesg), RSTRING_LEN(mesg),
                         arg->flags));
     return (VALUE)ret;
 }
@@ -121,7 +121,7 @@ recvfrom_blocking(void *data)
     struct recvfrom_arg *arg = data;
     socklen_t len0 = arg->alen;
     ssize_t ret;
-    ret = recvfrom(arg->fd, RSTRING_PTR(arg->str), arg->length,
+    ret = rb_tape_recvfrom(arg->fd, RSTRING_PTR(arg->str), arg->length,
                    arg->flags, &arg->buf.addr, &arg->alen);
 
     if (ret != -1 && len0 < arg->alen)
@@ -160,7 +160,7 @@ rsock_is_dgram(rb_io_t *fptr)
 {
     int socktype;
     socklen_t optlen = (socklen_t)sizeof(socktype);
-    int ret = getsockopt(fptr->fd, SOL_SOCKET, SO_TYPE, (void*)&socktype, &optlen);
+    int ret = rb_tape_getsockopt(fptr->fd, SOL_SOCKET, SO_TYPE, (void*)&socktype, &optlen);
     if (ret == -1) {
         rb_sys_fail("getsockopt(SO_TYPE)");
     }
@@ -280,7 +280,7 @@ rsock_s_recvfrom_nonblock(VALUE sock, VALUE len, VALUE flg, VALUE str,
         rb_io_set_nonblock(fptr);
 
     len0 = alen;
-    slen = recvfrom(fd, RSTRING_PTR(str), buflen, flags, &buf.addr, &alen);
+    slen = rb_tape_recvfrom(fd, RSTRING_PTR(str), buflen, flags, &buf.addr, &alen);
     if (slen != -1 && len0 < alen)
         alen = len0;
 
@@ -360,7 +360,7 @@ rsock_read_nonblock(VALUE sock, VALUE length, VALUE buf, VALUE ex)
     ptr = RSTRING_PTR(str);
     n = read_buffered_data(ptr, len, fptr);
     if (n <= 0) {
-        n = (long)recv(fptr->fd, ptr, len, MSG_DONTWAIT);
+        n = (long)rb_tape_recv(fptr->fd, ptr, len, MSG_DONTWAIT);
         if (n < 0) {
             int e = errno;
             if ((e == EWOULDBLOCK || e == EAGAIN)) {
@@ -409,7 +409,7 @@ rsock_write_nonblock(VALUE sock, VALUE str, VALUE ex)
 #ifdef __APPLE__
   again:
 #endif
-    n = (long)send(fptr->fd, RSTRING_PTR(str), RSTRING_LEN(str), MSG_DONTWAIT);
+    n = (long)rb_tape_send(fptr->fd, RSTRING_PTR(str), RSTRING_LEN(str), MSG_DONTWAIT);
     if (n < 0) {
         int e = errno;
 
@@ -441,7 +441,7 @@ rsock_socket0(int domain, int type, int proto)
     type |= SOCK_NONBLOCK;
 #endif
 
-    int result = socket(domain, type, proto);
+    int result = rb_tape_socket(domain, type, proto);
 
     if (result == -1)
         return -1;
@@ -480,7 +480,7 @@ wait_connectable(VALUE self, VALUE timeout, const struct sockaddr *sockaddr, int
     int fd = rb_io_descriptor(self);
 
     sockerrlen = (socklen_t)sizeof(sockerr);
-    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (void *)&sockerr, &sockerrlen) < 0)
+    if (rb_tape_getsockopt(fd, SOL_SOCKET, SO_ERROR, (void *)&sockerr, &sockerrlen) < 0)
         return -1;
 
     /* necessary for non-blocking sockets (at least ECONNREFUSED) */
@@ -525,7 +525,7 @@ wait_connectable(VALUE self, VALUE timeout, const struct sockaddr *sockaddr, int
         return -1;
 
     sockerrlen = (socklen_t)sizeof(sockerr);
-    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (void *)&sockerr, &sockerrlen) < 0)
+    if (rb_tape_getsockopt(fd, SOL_SOCKET, SO_ERROR, (void *)&sockerr, &sockerrlen) < 0)
         return -1;
 
     switch (sockerr) {
@@ -568,7 +568,7 @@ static VALUE
 connect_blocking(void *data)
 {
     struct connect_arg *arg = data;
-    return (VALUE)connect(arg->fd, arg->sockaddr, arg->len);
+    return (VALUE)rb_tape_connect(arg->fd, arg->sockaddr, arg->len);
 }
 
 #if defined(SOCKS) && !defined(SOCKS5)
@@ -576,7 +576,7 @@ static VALUE
 socks_connect_blocking(void *data)
 {
     struct connect_arg *arg = data;
-    return (VALUE)Rconnect(arg->fd, arg->sockaddr, arg->len);
+    return (VALUE)rb_tape_connect(arg->fd, arg->sockaddr, arg->len);
 }
 #endif
 
@@ -618,6 +618,12 @@ rsock_make_fd_nonblock(int fd)
     return;
 #endif
 
+    /* On replay the fd is virtual, so setting O_NONBLOCK on it is meaningless -- and the
+     * raw fcntl here (never taped, since it is setup rather than program behaviour) would
+     * fail EBADF on it. The fd's flags, if the program ever reads them, come off the tape
+     * through rb_tape_fcntl. Same reasoning as rb_maygvl_fd_fix_cloexec. */
+    if (rb_tape_replaying()) return;
+
     int flags;
 #ifdef F_GETFL
     flags = fcntl(fd, F_GETFL);
@@ -653,7 +659,7 @@ cloexec_accept(int socket, struct sockaddr *address, socklen_t *address_len)
     rsock_make_fd_nonblock(result);
 #endif
 #else
-    int result = accept(socket, address, address_len);
+    int result = rb_tape_accept(socket, address, address_len);
     if (result == -1) return -1;
 
     rb_maygvl_fd_fix_cloexec(result);
@@ -770,7 +776,7 @@ rsock_getfamily(rb_io_t *fptr)
     }
 
     ss.addr.sa_family = AF_UNSPEC;
-    if (getsockname(fptr->fd, &ss.addr, &sslen) < 0)
+    if (rb_tape_getsockname(fptr->fd, &ss.addr, &sslen) < 0)
         return AF_UNSPEC;
 
     switch (ss.addr.sa_family) {

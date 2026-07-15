@@ -134,20 +134,20 @@ init_inetsock_internal(VALUE v)
         if (type == INET_SERVER) {
 #if !defined(_WIN32) && !defined(__CYGWIN__)
             status = 1;
-            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+            rb_tape_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
                        (char*)&status, (socklen_t)sizeof(status));
 #endif
-            status = bind(fd, res->ai_addr, res->ai_addrlen);
+            status = rb_tape_bind(fd, res->ai_addr, res->ai_addrlen);
             syscall = "bind(2)";
         }
         else {
             if (lres) {
 #if !defined(_WIN32) && !defined(__CYGWIN__)
                 status = 1;
-                setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+                rb_tape_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
                            (char*)&status, (socklen_t)sizeof(status));
 #endif
-                status = bind(fd, lres->ai_addr, lres->ai_addrlen);
+                status = rb_tape_bind(fd, lres->ai_addr, lres->ai_addrlen);
                 local = status;
                 syscall = "bind(2)";
             }
@@ -197,7 +197,7 @@ init_inetsock_internal(VALUE v)
     arg->io = Qnil;
 
     if (type == INET_SERVER && io != Qnil) {
-        status = listen(rb_io_descriptor(io), SOMAXCONN);
+        status = rb_tape_listen(rb_io_descriptor(io), SOMAXCONN);
         if (status < 0) {
             error = errno;
             rb_io_close(io);
@@ -531,6 +531,7 @@ pick_addrinfo(struct hostname_resolution_store *resolution_store, int last_famil
 static void
 socket_nonblock_set(int fd)
 {
+    if (rb_tape_replaying()) return;   /* virtual fd: its O_NONBLOCK bit is meaningless */
     int flags = fcntl(fd, F_GETFL);
 
     if (flags < 0) rb_syserr_fail(errno, "fcntl(2)");
@@ -816,11 +817,11 @@ init_fast_fallback_inetsock_internal(VALUE v)
                 if (local_ai) {
                     #if !defined(_WIN32) && !defined(__CYGWIN__)
                     status = 1;
-                    if ((setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (char*)&status, (socklen_t)sizeof(status))) < 0) {
+                    if ((rb_tape_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (char*)&status, (socklen_t)sizeof(status))) < 0) {
                         rb_syserr_fail(errno, "setsockopt(2)");
                     }
                     #endif
-                    status = bind(fd, local_ai->ai_addr, local_ai->ai_addrlen);
+                    status = rb_tape_bind(fd, local_ai->ai_addr, local_ai->ai_addrlen);
                     local_status = status;
                     syscall = "bind(2)";
 
@@ -854,7 +855,7 @@ init_fast_fallback_inetsock_internal(VALUE v)
                     in_progress_fds(arg->connection_attempt_fds_size) ||
                     !resolution_store.is_all_finished) {
                     socket_nonblock_set(fd);
-                    status = connect(fd, remote_ai->ai_addr, remote_ai->ai_addrlen);
+                    status = rb_tape_connect(fd, remote_ai->ai_addr, remote_ai->ai_addrlen);
                     last_family = remote_ai->ai_family;
                 } else {
                     VALUE timeout = Qnil;
@@ -1014,7 +1015,7 @@ init_fast_fallback_inetsock_internal(VALUE v)
                     int err;
                     socklen_t len = sizeof(err);
 
-                    status = getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+                    status = rb_tape_getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
 
                     if (status < 0) {
                         last_error.type = SYSCALL_ERROR;
@@ -1299,7 +1300,7 @@ fast_fallback_inetsock_cleanup(VALUE v)
         if (connection_attempt_fd >= 0) {
             int error = 0;
             socklen_t len = sizeof(error);
-            getsockopt(connection_attempt_fd, SOL_SOCKET, SO_ERROR, &error, &len);
+            rb_tape_getsockopt(connection_attempt_fd, SOL_SOCKET, SO_ERROR, &error, &len);
             if (error == 0) shutdown(connection_attempt_fd, SHUT_RDWR);
             close(connection_attempt_fd);
        }
@@ -1469,7 +1470,7 @@ ip_inspect(VALUE sock)
     socklen_t len = (socklen_t)sizeof addr;
     ID id;
     if (fptr && fptr->fd >= 0 &&
-        getsockname(fptr->fd, &addr.addr, &len) >= 0 &&
+        rb_tape_getsockname(fptr->fd, &addr.addr, &len) >= 0 &&
         (id = rsock_intern_family(addr.addr.sa_family)) != 0) {
         VALUE family = rb_id2str(id);
         char hbuf[1024], pbuf[1024];
@@ -1523,7 +1524,7 @@ ip_addr(int argc, VALUE *argv, VALUE sock)
 
     if (argc < 1 || !rsock_revlookup_flag(argv[0], &norevlookup))
         norevlookup = rb_io_mode(sock) & FMODE_NOREVLOOKUP;
-    if (getsockname(rb_io_descriptor(sock), &addr.addr, &len) < 0)
+    if (rb_tape_getsockname(rb_io_descriptor(sock), &addr.addr, &len) < 0)
         rb_sys_fail("getsockname(2)");
     return rsock_ipaddr(&addr.addr, len, norevlookup);
 }
@@ -1561,7 +1562,7 @@ ip_peeraddr(int argc, VALUE *argv, VALUE sock)
 
     if (argc < 1 || !rsock_revlookup_flag(argv[0], &norevlookup))
         norevlookup = rb_io_mode(sock) & FMODE_NOREVLOOKUP;
-    if (getpeername(rb_io_descriptor(sock), &addr.addr, &len) < 0)
+    if (rb_tape_getpeername(rb_io_descriptor(sock), &addr.addr, &len) < 0)
         rb_sys_fail("getpeername(2)");
     return rsock_ipaddr(&addr.addr, len, norevlookup);
 }

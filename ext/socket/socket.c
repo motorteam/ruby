@@ -185,7 +185,7 @@ rsock_socketpair0(int domain, int type, int protocol, int descriptors[2])
     type |= SOCK_NONBLOCK;
 #endif
 
-    int result = socketpair(domain, type, protocol, descriptors);
+    int result = rb_tape_socketpair(domain, type, protocol, descriptors);
 
     if (result == -1)
         return -1;
@@ -417,7 +417,7 @@ sock_connect_nonblock(VALUE sock, VALUE addr, VALUE ex)
     addr = rb_str_new4(addr);
     GetOpenFile(sock, fptr);
     rb_io_set_nonblock(fptr);
-    n = connect(fptr->fd, (struct sockaddr*)RSTRING_PTR(addr), RSTRING_SOCKLEN(addr));
+    n = rb_tape_connect(fptr->fd, (struct sockaddr*)RSTRING_PTR(addr), RSTRING_SOCKLEN(addr));
     if (n < 0) {
         int e = errno;
         if (e == EINPROGRESS) {
@@ -531,7 +531,7 @@ sock_bind(VALUE sock, VALUE addr)
 
     SockAddrStringValueWithAddrinfo(addr, rai);
     GetOpenFile(sock, fptr);
-    if (bind(fptr->fd, (struct sockaddr*)RSTRING_PTR(addr), RSTRING_SOCKLEN(addr)) < 0)
+    if (rb_tape_bind(fptr->fd, (struct sockaddr*)RSTRING_PTR(addr), RSTRING_SOCKLEN(addr)) < 0)
         rsock_sys_fail_raddrinfo_or_sockaddr("bind(2)", addr, rai);
 
     return INT2FIX(0);
@@ -615,7 +615,7 @@ rsock_sock_listen(VALUE sock, VALUE log)
 
     backlog = NUM2INT(log);
     GetOpenFile(sock, fptr);
-    if (listen(fptr->fd, backlog) < 0)
+    if (rb_tape_listen(fptr->fd, backlog) < 0)
         rb_sys_fail("listen(2)");
 
     return INT2FIX(0);

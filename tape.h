@@ -17,6 +17,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <time.h>
+#include <sys/socket.h>   /* struct sockaddr, socklen_t -- for the socket effects */
 
 /**
  * The effect table -- Ruby's equivalent of Watt's kernel externals. Each entry
@@ -201,6 +202,26 @@ enum rb_tape_effect {
      * directories through do_opendir instead -- which is why this hid so well.)
      */
     RB_TAPE_FS_REALNAME     = 32,
+
+    /* Sockets. A socket's fd is created by a syscall the tape did not hook, so on replay
+     * it is a real kernel fd whose *number* need not match the recording's -- and every
+     * later read, write and fcntl is keyed by that number. The fix is the one files use:
+     * serve the recorded fd and never really open. That makes the fd fully virtual, so
+     * the whole lifecycle has to come off the tape too -- connect, accept (a new fd),
+     * bind, listen, the names, the options, and address resolution. Append only. */
+    RB_TAPE_NET_SOCKET      = 33,   /* socket(2) and socketpair(2) -- returns the fd(s) */
+    RB_TAPE_NET_CONNECT     = 34,
+    RB_TAPE_NET_ACCEPT      = 35,   /* accept(2) -- returns a new fd and the peer address */
+    RB_TAPE_NET_BIND        = 36,
+    RB_TAPE_NET_LISTEN      = 37,
+    RB_TAPE_NET_SOCKNAME    = 38,   /* getsockname/getpeername -- returns an address */
+    RB_TAPE_NET_SOCKOPT     = 39,   /* getsockopt (setsockopt just returns a status) */
+    RB_TAPE_NET_GETADDRINFO = 40,   /* getaddrinfo(3) -- returns the resolved list */
+    RB_TAPE_NET_RECVFROM    = 41,   /* recv/recvfrom -- bytes plus the peer address */
+    RB_TAPE_NET_GETNAMEINFO = 42,   /* getnameinfo(3) -- returns host/serv strings */
+    RB_TAPE_NET_SEND        = 43,   /* send/sendto/sendmsg -- the byte count returned */
+    RB_TAPE_NET_RECVMSG     = 44,   /* recvmsg -- bytes, control (passed fds), address */
+
     RB_TAPE_EFFECT_MAX
 };
 
@@ -264,8 +285,12 @@ void rb_tape_inspect(const char *path);
  */
 void rb_tape_finish(int exit_status);
 
+/* Exported: ext/socket asks these to decide whether a setup fixup (nonblock, cloexec)
+ * should touch a fd that, on replay, is virtual. */
+RUBY_SYMBOL_EXPORT_BEGIN
 int rb_tape_recording(void);
 int rb_tape_replaying(void);
+RUBY_SYMBOL_EXPORT_END
 
 /**
  * Suspend the tape while the loader reaches for program text.
@@ -437,7 +462,11 @@ ssize_t rb_tape_replay_write(int fd, const void *buf, size_t capa);
 
 int rb_tape_close(int fd);
 int rb_tape_isatty(int fd);
+/* Exported: ext/socket fstats a descriptor it received over a unix socket (SCM_RIGHTS)
+ * to decide whether to wrap it as a Socket or an IO; on replay that fd is virtual. */
+RUBY_SYMBOL_EXPORT_BEGIN
 int rb_tape_fstat(int fd, struct stat *st);
+RUBY_SYMBOL_EXPORT_END
 int rb_tape_stat(const char *path, struct stat *st);
 int rb_tape_lstat(const char *path, struct stat *st);
 off_t rb_tape_lseek(int fd, off_t offset, int whence);
@@ -541,6 +570,38 @@ long rb_tape_replay_waitpid(int *status);
 void rb_tape_record_waitpid(long pid, int status, int err);
 
 int rb_tape_pipe(int descriptors[2], int (*call)(int[2]));
+
+/**
+ * Sockets. Each is a drop-in for the syscall it wraps: on record it makes the real call
+ * and tapes the result; on replay it serves the recording and touches no kernel socket, so
+ * the fd it returns is virtual, exactly like a replayed file's. The peer/socket addresses
+ * that accept/getsockname/recvfrom fill are scatter args, captured post-call and rewritten
+ * on replay. See RB_TAPE_NET_SOCKET.
+ *
+ * Unlike every other tape hook, these are called from ext/socket -- a separately linked
+ * extension -- so they have to be *exported* to be found at load time. The rest of the
+ * tape lives entirely inside the ruby binary and needs no export.
+ */
+RUBY_SYMBOL_EXPORT_BEGIN
+int rb_tape_socket(int domain, int type, int protocol);
+int rb_tape_socketpair(int domain, int type, int protocol, int sv[2]);
+int rb_tape_connect(int fd, const struct sockaddr *addr, socklen_t len);
+int rb_tape_bind(int fd, const struct sockaddr *addr, socklen_t len);
+int rb_tape_listen(int fd, int backlog);
+int rb_tape_accept(int fd, struct sockaddr *addr, socklen_t *addrlen);
+int rb_tape_getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen);
+int rb_tape_getpeername(int fd, struct sockaddr *addr, socklen_t *addrlen);
+int rb_tape_getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen);
+int rb_tape_setsockopt(int fd, int level, int optname, const void *optval, socklen_t optlen);
+ssize_t rb_tape_send(int fd, const void *buf, size_t len, int flags);
+ssize_t rb_tape_sendto(int fd, const void *buf, size_t len, int flags,
+                       const struct sockaddr *to, socklen_t tolen);
+ssize_t rb_tape_sendmsg(int fd, const struct msghdr *msg, int flags);
+ssize_t rb_tape_recv(int fd, void *buf, size_t len, int flags);
+ssize_t rb_tape_recvfrom(int fd, void *buf, size_t len, int flags,
+                         struct sockaddr *from, socklen_t *fromlen);
+ssize_t rb_tape_recvmsg(int fd, struct msghdr *msg, int flags);
+RUBY_SYMBOL_EXPORT_END
 
 /** fcntl(fd, cmd) -- the one-argument commands, F_GETFL and friends. */
 int rb_tape_fcntl(int fd, int cmd);

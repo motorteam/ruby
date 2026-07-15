@@ -77,7 +77,7 @@ rsock_init_unixsock(VALUE self, VALUE path, int server)
     RB_IO_POINTER(io, fptr);
 
     if (server) {
-        status = bind(fd, (struct sockaddr*)&sockaddr, sockaddrlen);
+        status = rb_tape_bind(fd, (struct sockaddr*)&sockaddr, sockaddrlen);
     }
     else {
         int error_tag;
@@ -101,7 +101,7 @@ rsock_init_unixsock(VALUE self, VALUE path, int server)
     }
 
     if (server) {
-        if (listen(fd, SOMAXCONN) < 0) {
+        if (rb_tape_listen(fd, SOMAXCONN) < 0) {
             int e = errno;
             rb_io_close(io);
             rsock_syserr_fail_path(e, "listen(2)", path);
@@ -153,7 +153,7 @@ unix_path(VALUE sock)
         struct sockaddr_un addr;
         socklen_t len = (socklen_t)sizeof(addr);
         socklen_t len0 = len;
-        if (getsockname(fptr->fd, (struct sockaddr*)&addr, &len) < 0)
+        if (rb_tape_getsockname(fptr->fd, (struct sockaddr*)&addr, &len) < 0)
             rsock_sys_fail_path("getsockname(2)", fptr->pathv);
         if (len0 < len) len = len0;
         fptr->pathv = rb_obj_freeze(rsock_unixpath_str(&addr, len));
@@ -215,7 +215,7 @@ static VALUE
 sendmsg_blocking(void *data)
 {
     struct iomsg_arg *arg = data;
-    return sendmsg(arg->fd, &arg->msg, 0);
+    return rb_tape_sendmsg(arg->fd, &arg->msg, 0);
 }
 
 /*
@@ -502,7 +502,7 @@ unix_addr(VALUE sock)
 
     GetOpenFile(sock, fptr);
 
-    if (getsockname(fptr->fd, (struct sockaddr*)&addr, &len) < 0)
+    if (rb_tape_getsockname(fptr->fd, (struct sockaddr*)&addr, &len) < 0)
         rsock_sys_fail_path("getsockname(2)", fptr->pathv);
     if (len0 < len) len = len0;
     return rsock_unixaddr(&addr, len);
@@ -530,7 +530,7 @@ unix_peeraddr(VALUE sock)
 
     GetOpenFile(sock, fptr);
 
-    if (getpeername(fptr->fd, (struct sockaddr*)&addr, &len) < 0)
+    if (rb_tape_getpeername(fptr->fd, (struct sockaddr*)&addr, &len) < 0)
         rsock_sys_fail_path("getpeername(2)", fptr->pathv);
     if (len0 < len) len = len0;
     return rsock_unixaddr(&addr, len);

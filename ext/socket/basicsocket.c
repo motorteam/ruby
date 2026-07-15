@@ -18,7 +18,7 @@ is_socket(int fd)
 {
     struct stat sbuf;
 
-    if (fstat(fd, &sbuf) < 0)
+    if (rb_tape_fstat(fd, &sbuf) < 0)
         rb_sys_fail("fstat(2)");
     return S_ISSOCK(sbuf.st_mode);
 }
@@ -264,7 +264,7 @@ bsock_setsockopt(int argc, VALUE *argv, VALUE sock)
     }
 
     rb_io_check_closed(fptr);
-    if (setsockopt(fptr->fd, level, option, v, vlen) < 0)
+    if (rb_tape_setsockopt(fptr->fd, level, option, v, vlen) < 0)
         rsock_sys_fail_path("setsockopt(2)", fptr->pathv);
 
     return INT2FIX(0);
@@ -356,7 +356,7 @@ bsock_getsockopt(VALUE sock, VALUE lev, VALUE optname)
 
     rb_io_check_closed(fptr);
 
-    if (getsockopt(fptr->fd, level, option, buf, &len) < 0)
+    if (rb_tape_getsockopt(fptr->fd, level, option, buf, &len) < 0)
         rsock_sys_fail_path("getsockopt(2)", fptr->pathv);
 
     return rsock_sockopt_new(family, level, option, rb_str_new(buf, len));
@@ -384,7 +384,7 @@ bsock_getsockname(VALUE sock)
     rb_io_t *fptr;
 
     GetOpenFile(sock, fptr);
-    if (getsockname(fptr->fd, &buf.addr, &len) < 0)
+    if (rb_tape_getsockname(fptr->fd, &buf.addr, &len) < 0)
         rb_sys_fail("getsockname(2)");
     if (len0 < len) len = len0;
     return rb_str_new((char*)&buf, len);
@@ -415,7 +415,7 @@ bsock_getpeername(VALUE sock)
     rb_io_t *fptr;
 
     GetOpenFile(sock, fptr);
-    if (getpeername(fptr->fd, &buf.addr, &len) < 0)
+    if (rb_tape_getpeername(fptr->fd, &buf.addr, &len) < 0)
         rb_sys_fail("getpeername(2)");
     if (len0 < len) len = len0;
     return rb_str_new((char*)&buf, len);
@@ -460,7 +460,7 @@ bsock_getpeereid(VALUE self)
     struct ucred cred;
     socklen_t len = sizeof(cred);
     GetOpenFile(self, fptr);
-    if (getsockopt(fptr->fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == -1)
+    if (rb_tape_getsockopt(fptr->fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == -1)
         rb_sys_fail("getsockopt(SO_PEERCRED)");
     return rb_assoc_new(UIDT2NUM(cred.uid), GIDT2NUM(cred.gid));
 #elif defined(HAVE_GETPEERUCRED) /* Solaris */
@@ -505,7 +505,7 @@ bsock_local_address(VALUE sock)
     rb_io_t *fptr;
 
     GetOpenFile(sock, fptr);
-    if (getsockname(fptr->fd, &buf.addr, &len) < 0)
+    if (rb_tape_getsockname(fptr->fd, &buf.addr, &len) < 0)
         rb_sys_fail("getsockname(2)");
     if (len0 < len) len = len0;
     return rsock_fd_socket_addrinfo(fptr->fd, &buf.addr, len);
@@ -539,7 +539,7 @@ bsock_remote_address(VALUE sock)
     rb_io_t *fptr;
 
     GetOpenFile(sock, fptr);
-    if (getpeername(fptr->fd, &buf.addr, &len) < 0)
+    if (rb_tape_getpeername(fptr->fd, &buf.addr, &len) < 0)
         rb_sys_fail("getpeername(2)");
     if (len0 < len) len = len0;
     return rsock_fd_socket_addrinfo(fptr->fd, &buf.addr, len);

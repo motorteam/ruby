@@ -150,6 +150,7 @@
 #include "ruby/util.h"
 #include "sockport.h"
 #include "ruby/fiber/scheduler.h"
+#include "tape.h"       /* record/replay the socket lifecycle -- rb_tape_socket &c. */
 
 #ifndef HAVE_TYPE_SOCKLEN_T
 typedef int socklen_t;

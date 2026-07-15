@@ -1081,7 +1081,7 @@ rsock_fd_family(int fd)
     struct sockaddr sa = { 0 };
     socklen_t sa_len = sizeof(sa);
 
-    if (fd < 0 || getsockname(fd, &sa, &sa_len) != 0 ||
+    if (fd < 0 || rb_tape_getsockname(fd, &sa, &sa_len) != 0 ||
         (size_t)sa_len < offsetof(struct sockaddr, sa_family) + sizeof(sa.sa_family)) {
         return AF_UNSPEC;
     }
@@ -3074,7 +3074,7 @@ rsock_fd_socket_addrinfo(int fd, struct sockaddr *addr, socklen_t len)
     /* assumes protocol family and address family are identical */
     family = get_afamily(addr, len);
 
-    ret = getsockopt(fd, SOL_SOCKET, SO_TYPE, (void*)&socktype, &optlen);
+    ret = rb_tape_getsockopt(fd, SOL_SOCKET, SO_TYPE, (void*)&socktype, &optlen);
     if (ret == -1) {
         rb_sys_fail("getsockopt(SO_TYPE)");
     }

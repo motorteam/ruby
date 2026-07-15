@@ -104,7 +104,7 @@ udp_bind_internal(VALUE v)
     RB_IO_POINTER(arg->io, fptr);
 
     for (res = arg->res->ai; res; res = res->ai_next) {
-        if (bind(fptr->fd, res->ai_addr, res->ai_addrlen) < 0) {
+        if (rb_tape_bind(fptr->fd, res->ai_addr, res->ai_addrlen) < 0) {
             continue;
         }
         return Qtrue;

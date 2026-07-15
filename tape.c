@@ -87,6 +87,18 @@ static const char *const tape_effect_fqn[] = {
     "fs.loadok",
     "fs.loadfile",
     "fs.realname",
+    "net.socket",
+    "net.connect",
+    "net.accept",
+    "net.bind",
+    "net.listen",
+    "net.sockname",
+    "net.sockopt",
+    "net.getaddrinfo",
+    "net.recvfrom",
+    "net.getnameinfo",
+    "net.send",
+    "net.recvmsg",
 };
 
 /* Effect signatures, for the Signature column of `--tape-inspect`. Ruby is
@@ -2215,6 +2227,469 @@ rb_tape_pipe(int descriptors[2], int (*call)(int[2]))
             put_i64(&e->ret, (int64_t)ret);
             put_i64(&e->ret, (int64_t)(ret < 0 ? err : descriptors[0]));
             put_i64(&e->ret, (int64_t)(ret < 0 ? err : descriptors[1]));
+            entry_commit(e);
+        }
+    }
+    errno = err;
+    return ret;
+}
+
+/* ── Effect: sockets ──────────────────────────────────────────────────────────
+ *
+ * A socket fd is created by a syscall the tape never hooked, so on replay it was a real
+ * kernel fd whose number need not match the recording's -- and the reads, writes and
+ * fcntls keyed on that number then missed. The fix is the one files use: serve the
+ * recorded fd and open no real socket. That makes the fd virtual, so the rest of the
+ * lifecycle -- connect, accept, bind, listen, the names, the options -- has to be served
+ * too, since a real syscall on a virtual fd only fails. Each of these is a plain drop-in
+ * around its syscall; the addresses they fill are captured as scatter args, replayed back.
+ *
+ * All are keyed on the calling thread (the default), not the fd: none of them read or
+ * write a byte, so they need no order against the socket's data stream -- exactly the
+ * argument that moved close and fstat off it.
+ */
+int
+rb_tape_socket(int domain, int type, int protocol)
+{
+    if (rb_tape_replaying()) {
+        const tape_entry *e = tape_next(RB_TAPE_NET_SOCKET);
+        int fd = (int)get_i64(e->ret.ptr);
+        if (fd < 0 && e->ret.len >= 16) errno = (int)get_i64(e->ret.ptr + 8);
+        return fd;
+    }
+    int fd = socket(domain, type, protocol);
+    int err = errno;
+    if (rb_tape_recording()) {
+        tape_entry *e = entry_begin(RB_TAPE_NET_SOCKET);
+        if (e) {
+            put_i64(&e->ret, (int64_t)fd);
+            put_i64(&e->ret, (int64_t)(fd < 0 ? err : 0));
+            entry_commit(e);
+        }
+    }
+    errno = err;
+    return fd;
+}
+
+int
+rb_tape_socketpair(int domain, int type, int protocol, int sv[2])
+{
+    if (rb_tape_replaying()) {
+        const tape_entry *e = tape_next(RB_TAPE_NET_SOCKET);
+        int ret = (int)get_i64(e->ret.ptr);
+        if (ret < 0) {
+            if (e->ret.len >= 32) errno = (int)get_i64(e->ret.ptr + 24);
+            return ret;
+        }
+        sv[0] = (int)get_i64(e->ret.ptr + 8);
+        sv[1] = (int)get_i64(e->ret.ptr + 16);
+        return ret;
+    }
+    int ret = socketpair(domain, type, protocol, sv);
+    int err = errno;
+    if (rb_tape_recording()) {
+        tape_entry *e = entry_begin(RB_TAPE_NET_SOCKET);
+        if (e) {
+            put_i64(&e->ret, (int64_t)ret);
+            put_i64(&e->ret, (int64_t)(ret < 0 ? 0 : sv[0]));
+            put_i64(&e->ret, (int64_t)(ret < 0 ? 0 : sv[1]));
+            put_i64(&e->ret, (int64_t)(ret < 0 ? err : 0));
+            entry_commit(e);
+        }
+    }
+    errno = err;
+    return ret;
+}
+
+/* A status-only call on a socket fd: connect, bind, listen, setsockopt. The address (or
+ * option value) is an input, so nothing is captured but the return and errno. */
+static int
+tape_net_status(int effect, int ret_real, int err_real)
+{
+    if (rb_tape_recording()) {
+        tape_entry *e = entry_begin(effect);
+        if (e) {
+            put_i64(&e->ret, (int64_t)ret_real);
+            put_i64(&e->ret, (int64_t)(ret_real < 0 ? err_real : 0));
+            entry_commit(e);
+        }
+    }
+    return ret_real;
+}
+
+static int
+tape_net_status_replay(int effect, int *out_ret)
+{
+    const tape_entry *e = tape_next(effect);
+    int ret = (int)get_i64(e->ret.ptr);
+    if (ret < 0 && e->ret.len >= 16) errno = (int)get_i64(e->ret.ptr + 8);
+    *out_ret = ret;
+    return 1;
+}
+
+int
+rb_tape_connect(int fd, const struct sockaddr *addr, socklen_t len)
+{
+    int ret;
+    if (rb_tape_replaying()) { tape_net_status_replay(RB_TAPE_NET_CONNECT, &ret); return ret; }
+    ret = connect(fd, addr, len);
+    int err = errno;
+    tape_net_status(RB_TAPE_NET_CONNECT, ret, err);
+    errno = err;
+    return ret;
+}
+
+int
+rb_tape_bind(int fd, const struct sockaddr *addr, socklen_t len)
+{
+    int ret;
+    if (rb_tape_replaying()) { tape_net_status_replay(RB_TAPE_NET_BIND, &ret); return ret; }
+    ret = bind(fd, addr, len);
+    int err = errno;
+    tape_net_status(RB_TAPE_NET_BIND, ret, err);
+    errno = err;
+    return ret;
+}
+
+int
+rb_tape_listen(int fd, int backlog)
+{
+    int ret;
+    if (rb_tape_replaying()) { tape_net_status_replay(RB_TAPE_NET_LISTEN, &ret); return ret; }
+    ret = listen(fd, backlog);
+    int err = errno;
+    tape_net_status(RB_TAPE_NET_LISTEN, ret, err);
+    errno = err;
+    return ret;
+}
+
+int
+rb_tape_setsockopt(int fd, int level, int optname, const void *optval, socklen_t optlen)
+{
+    int ret;
+    if (rb_tape_replaying()) { tape_net_status_replay(RB_TAPE_NET_SOCKOPT, &ret); return ret; }
+    ret = setsockopt(fd, level, optname, optval, optlen);
+    int err = errno;
+    tape_net_status(RB_TAPE_NET_SOCKOPT, ret, err);
+    errno = err;
+    return ret;
+}
+
+/* A call that fills an address the program then reads back: accept (also a new fd),
+ * getsockname, getpeername. The filled bytes are a scatter arg. */
+int
+rb_tape_accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
+{
+    if (rb_tape_replaying()) {
+        const tape_entry *e = tape_next(RB_TAPE_NET_ACCEPT);
+        int nfd = (int)get_i64(e->ret.ptr);
+        if (nfd < 0) {
+            if (e->ret.len >= 16) errno = (int)get_i64(e->ret.ptr + 8);
+            return nfd;
+        }
+        const tape_iov *iov = entry_find_iov(e, 0);
+        if (iov && addr && addrlen) {
+            socklen_t n = iov->bytes.len < *addrlen ? (socklen_t)iov->bytes.len : *addrlen;
+            memcpy(addr, iov->bytes.ptr, n);
+            *addrlen = (socklen_t)iov->bytes.len;
+        }
+        return nfd;
+    }
+    int nfd = accept(fd, addr, addrlen);
+    int err = errno;
+    if (rb_tape_recording()) {
+        tape_entry *e = entry_begin(RB_TAPE_NET_ACCEPT);
+        if (e) {
+            put_i64(&e->ret, (int64_t)nfd);
+            put_i64(&e->ret, (int64_t)(nfd < 0 ? err : 0));
+            if (nfd >= 0 && addr && addrlen) entry_iov(e, 0, addr, *addrlen);
+            entry_commit(e);
+        }
+    }
+    errno = err;
+    return nfd;
+}
+
+static int
+tape_net_getname(int fd, struct sockaddr *addr, socklen_t *addrlen,
+                 int (*call)(int, struct sockaddr *, socklen_t *))
+{
+    if (rb_tape_replaying()) {
+        const tape_entry *e = tape_next(RB_TAPE_NET_SOCKNAME);
+        int ret = (int)get_i64(e->ret.ptr);
+        if (ret < 0) {
+            if (e->ret.len >= 16) errno = (int)get_i64(e->ret.ptr + 8);
+            return ret;
+        }
+        const tape_iov *iov = entry_find_iov(e, 0);
+        if (iov && addr && addrlen) {
+            socklen_t n = iov->bytes.len < *addrlen ? (socklen_t)iov->bytes.len : *addrlen;
+            memcpy(addr, iov->bytes.ptr, n);
+            *addrlen = (socklen_t)iov->bytes.len;
+        }
+        return ret;
+    }
+    int ret = call(fd, addr, addrlen);
+    int err = errno;
+    if (rb_tape_recording()) {
+        tape_entry *e = entry_begin(RB_TAPE_NET_SOCKNAME);
+        if (e) {
+            put_i64(&e->ret, (int64_t)ret);
+            put_i64(&e->ret, (int64_t)(ret < 0 ? err : 0));
+            if (ret == 0 && addr && addrlen) entry_iov(e, 0, addr, *addrlen);
+            entry_commit(e);
+        }
+    }
+    errno = err;
+    return ret;
+}
+
+int
+rb_tape_getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen)
+{
+    return tape_net_getname(fd, addr, addrlen, getsockname);
+}
+
+int
+rb_tape_getpeername(int fd, struct sockaddr *addr, socklen_t *addrlen)
+{
+    return tape_net_getname(fd, addr, addrlen, getpeername);
+}
+
+int
+rb_tape_getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen)
+{
+    if (rb_tape_replaying()) {
+        const tape_entry *e = tape_next(RB_TAPE_NET_SOCKOPT);
+        int ret = (int)get_i64(e->ret.ptr);
+        if (ret < 0) {
+            if (e->ret.len >= 16) errno = (int)get_i64(e->ret.ptr + 8);
+            return ret;
+        }
+        const tape_iov *iov = entry_find_iov(e, 0);
+        if (iov && optval && optlen) {
+            socklen_t n = iov->bytes.len < *optlen ? (socklen_t)iov->bytes.len : *optlen;
+            memcpy(optval, iov->bytes.ptr, n);
+            *optlen = (socklen_t)iov->bytes.len;
+        }
+        return ret;
+    }
+    int ret = getsockopt(fd, level, optname, optval, optlen);
+    int err = errno;
+    if (rb_tape_recording()) {
+        tape_entry *e = entry_begin(RB_TAPE_NET_SOCKOPT);
+        if (e) {
+            put_i64(&e->ret, (int64_t)ret);
+            put_i64(&e->ret, (int64_t)(ret < 0 ? err : 0));
+            if (ret == 0 && optval && optlen) entry_iov(e, 0, optval, *optlen);
+            entry_commit(e);
+        }
+    }
+    errno = err;
+    return ret;
+}
+
+/* Send-side data ops -- send, sendto, sendmsg. The bytes are the program's own output; the
+ * socket does not exist on replay to take them, so only the count pushed (and errno) come
+ * back off the tape. Recorded on RB_TAPE_NET_SEND, keyed to the calling thread. */
+static ssize_t
+tape_net_send_replay(void)
+{
+    const tape_entry *e = tape_next(RB_TAPE_NET_SEND);
+    ssize_t ret = (ssize_t)get_i64(e->ret.ptr);
+    if (ret < 0 && e->ret.len >= 16) errno = (int)get_i64(e->ret.ptr + 8);
+    return ret;
+}
+
+static void
+tape_net_send_record(ssize_t ret, int err)
+{
+    if (!rb_tape_recording()) return;
+    tape_entry *e = entry_begin(RB_TAPE_NET_SEND);
+    if (e) {
+        put_i64(&e->ret, (int64_t)ret);
+        put_i64(&e->ret, (int64_t)(ret < 0 ? err : 0));
+        entry_commit(e);
+    }
+}
+
+ssize_t
+rb_tape_send(int fd, const void *buf, size_t len, int flags)
+{
+    if (rb_tape_replaying()) return tape_net_send_replay();
+    ssize_t ret = send(fd, buf, len, flags);
+    int err = errno;
+    tape_net_send_record(ret, err);
+    errno = err;
+    return ret;
+}
+
+ssize_t
+rb_tape_sendto(int fd, const void *buf, size_t len, int flags,
+               const struct sockaddr *to, socklen_t tolen)
+{
+    if (rb_tape_replaying()) return tape_net_send_replay();
+    ssize_t ret = sendto(fd, buf, len, flags, to, tolen);
+    int err = errno;
+    tape_net_send_record(ret, err);
+    errno = err;
+    return ret;
+}
+
+ssize_t
+rb_tape_sendmsg(int fd, const struct msghdr *msg, int flags)
+{
+    if (rb_tape_replaying()) return tape_net_send_replay();
+    ssize_t ret = sendmsg(fd, msg, flags);
+    int err = errno;
+    tape_net_send_record(ret, err);
+    errno = err;
+    return ret;
+}
+
+/* Receive-side -- recv, recvfrom. The bytes arrive from the network, so they are a genuine
+ * input and go on the tape (iov 0), along with the peer address recvfrom fills (iov 1). */
+static ssize_t
+tape_net_recv(int effect, int fd, void *buf, size_t len, int flags,
+              struct sockaddr *from, socklen_t *fromlen,
+              ssize_t (*call)(int, void *, size_t, int, struct sockaddr *, socklen_t *))
+{
+    if (rb_tape_replaying()) {
+        const tape_entry *e = tape_next(effect);
+        ssize_t ret = (ssize_t)get_i64(e->ret.ptr);
+        if (ret < 0) {
+            if (e->ret.len >= 16) errno = (int)get_i64(e->ret.ptr + 8);
+            return ret;
+        }
+        const tape_iov *data = entry_find_iov(e, 0);
+        if (data && buf) {
+            size_t n = data->bytes.len < len ? data->bytes.len : len;
+            memcpy(buf, data->bytes.ptr, n);
+        }
+        const tape_iov *addr = entry_find_iov(e, 1);
+        if (addr && from && fromlen) {
+            socklen_t n = addr->bytes.len < *fromlen ? (socklen_t)addr->bytes.len : *fromlen;
+            memcpy(from, addr->bytes.ptr, n);
+            *fromlen = (socklen_t)addr->bytes.len;
+        }
+        return ret;
+    }
+    ssize_t ret = call(fd, buf, len, flags, from, fromlen);
+    int err = errno;
+    if (rb_tape_recording()) {
+        tape_entry *e = entry_begin(effect);
+        if (e) {
+            put_i64(&e->ret, (int64_t)ret);
+            put_i64(&e->ret, (int64_t)(ret < 0 ? err : 0));
+            if (ret >= 0) {
+                entry_iov(e, 0, buf, (size_t)ret);
+                if (from && fromlen) entry_iov(e, 1, from, *fromlen);
+            }
+            entry_commit(e);
+        }
+    }
+    errno = err;
+    return ret;
+}
+
+static ssize_t call_recvfrom(int fd, void *buf, size_t len, int flags,
+                             struct sockaddr *from, socklen_t *fromlen)
+{
+    return recvfrom(fd, buf, len, flags, from, fromlen);
+}
+static ssize_t call_recv(int fd, void *buf, size_t len, int flags,
+                         struct sockaddr *from, socklen_t *fromlen)
+{
+    (void)from; (void)fromlen;
+    return recv(fd, buf, len, flags);
+}
+
+ssize_t
+rb_tape_recvfrom(int fd, void *buf, size_t len, int flags,
+                 struct sockaddr *from, socklen_t *fromlen)
+{
+    return tape_net_recv(RB_TAPE_NET_RECVFROM, fd, buf, len, flags, from, fromlen, call_recvfrom);
+}
+
+ssize_t
+rb_tape_recv(int fd, void *buf, size_t len, int flags)
+{
+    return tape_net_recv(RB_TAPE_NET_RECVFROM, fd, buf, len, flags, NULL, NULL, call_recv);
+}
+
+/*
+ * recvmsg -- the hardest of the family, because its message carries three things: the
+ * scattered data (across msg_iov), the peer address (msg_name), and the control block
+ * (msg_control) -- which is how a unix socket passes an open file descriptor. All three go
+ * on the tape (iovs 0/1/2), the lengths and msg_flags in the return buffer. A passed fd is
+ * a number the kernel minted in the receiver; served back verbatim, the program uses it as
+ * an ordinary virtual fd, and its reads and writes were on the tape under that number too.
+ */
+ssize_t
+rb_tape_recvmsg(int fd, struct msghdr *msg, int flags)
+{
+    if (rb_tape_replaying()) {
+        const tape_entry *e = tape_next(RB_TAPE_NET_RECVMSG);
+        ssize_t ret = (ssize_t)get_i64(e->ret.ptr);
+        if (ret < 0) {
+            if (e->ret.len >= 16) errno = (int)get_i64(e->ret.ptr + 8);
+            return ret;
+        }
+        const tape_iov *data = entry_find_iov(e, 0);
+        if (data && msg->msg_iov) {                 /* scatter the data back across msg_iov */
+            size_t left = data->bytes.len;
+            const uint8_t *p = data->bytes.ptr;
+            for (int i = 0; i < msg->msg_iovlen && left; i++) {
+                size_t n = msg->msg_iov[i].iov_len < left ? msg->msg_iov[i].iov_len : left;
+                memcpy(msg->msg_iov[i].iov_base, p, n);
+                p += n; left -= n;
+            }
+        }
+        const tape_iov *name = entry_find_iov(e, 1);
+        if (name && msg->msg_name) {
+            socklen_t n = name->bytes.len < msg->msg_namelen ? (socklen_t)name->bytes.len : msg->msg_namelen;
+            memcpy(msg->msg_name, name->bytes.ptr, n);
+        }
+        msg->msg_namelen = (socklen_t)get_i64(e->ret.ptr + 16);
+        const tape_iov *ctrl = entry_find_iov(e, 2);
+        if (ctrl && msg->msg_control) {
+            socklen_t n = ctrl->bytes.len < msg->msg_controllen ? (socklen_t)ctrl->bytes.len : msg->msg_controllen;
+            memcpy(msg->msg_control, ctrl->bytes.ptr, n);
+        }
+        msg->msg_controllen = (socklen_t)get_i64(e->ret.ptr + 24);
+        msg->msg_flags = (int)get_i64(e->ret.ptr + 32);
+        return ret;
+    }
+    ssize_t ret = recvmsg(fd, msg, flags);
+    int err = errno;
+    if (rb_tape_recording()) {
+        tape_entry *e = entry_begin(RB_TAPE_NET_RECVMSG);
+        if (e) {
+            put_i64(&e->ret, (int64_t)ret);
+            put_i64(&e->ret, (int64_t)(ret < 0 ? err : 0));
+            put_i64(&e->ret, (int64_t)msg->msg_namelen);
+            put_i64(&e->ret, (int64_t)msg->msg_controllen);
+            put_i64(&e->ret, (int64_t)msg->msg_flags);
+            if (ret >= 0) {
+                if (msg->msg_iovlen == 1) {         /* the common case: one buffer, no gather */
+                    entry_iov(e, 0, msg->msg_iov[0].iov_base, (size_t)ret);
+                }
+                else {                              /* gather the scattered data into one blob */
+                    uint8_t *blob = malloc((size_t)ret ? (size_t)ret : 1);
+                    size_t off = 0, left = (size_t)ret;
+                    for (int i = 0; i < msg->msg_iovlen && left; i++) {
+                        size_t n = msg->msg_iov[i].iov_len < left ? msg->msg_iov[i].iov_len : left;
+                        memcpy(blob + off, msg->msg_iov[i].iov_base, n);
+                        off += n; left -= n;
+                    }
+                    entry_iov(e, 0, blob, (size_t)ret);
+                    free(blob);
+                }
+                if (msg->msg_name && msg->msg_namelen)
+                    entry_iov(e, 1, msg->msg_name, msg->msg_namelen);
+                if (msg->msg_control && msg->msg_controllen)
+                    entry_iov(e, 2, msg->msg_control, msg->msg_controllen);
+            }
             entry_commit(e);
         }
     }

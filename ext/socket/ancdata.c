@@ -1136,7 +1136,7 @@ static void *
 nogvl_sendmsg_func(void *ptr)
 {
     struct sendmsg_args_struct *args = ptr;
-    return (void *)(VALUE)sendmsg(args->fd, args->msg, args->flags);
+    return (void *)(VALUE)rb_tape_sendmsg(args->fd, args->msg, args->flags);
 }
 
 static ssize_t
@@ -1360,7 +1360,7 @@ rsock_recvmsg(int socket, struct msghdr *message, int flags)
     flags |= MSG_CMSG_CLOEXEC;
 #endif
     len0 = message->msg_namelen;
-    ret = recvmsg(socket, message, flags);
+    ret = rb_tape_recvmsg(socket, message, flags);
     if (ret != -1 && len0 < message->msg_namelen)
         message->msg_namelen = len0;
     return ret;
@@ -1446,7 +1446,7 @@ make_io_for_unix_rights(VALUE ctl, struct cmsghdr *cmh, char *msg_end)
             int fd = *fdp;
             struct stat stbuf;
             VALUE io;
-            if (fstat(fd, &stbuf) == -1)
+            if (rb_tape_fstat(fd, &stbuf) == -1)
                 rb_raise(rb_eSocket, "invalid fd in SCM_RIGHTS");
             rb_update_max_fd(fd);
             rb_maygvl_fd_fix_cloexec(fd);
@@ -1522,7 +1522,7 @@ bsock_recvmsg_internal(VALUE sock,
     if (grow_buffer) {
         int socktype;
         socklen_t optlen = (socklen_t)sizeof(socktype);
-        if (getsockopt(fptr->fd, SOL_SOCKET, SO_TYPE, (void*)&socktype, &optlen) == -1) {
+        if (rb_tape_getsockopt(fptr->fd, SOL_SOCKET, SO_TYPE, (void*)&socktype, &optlen) == -1) {
             rb_sys_fail("getsockopt(SO_TYPE)");
         }
         if (socktype == SOCK_STREAM)

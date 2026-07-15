@@ -286,6 +286,10 @@ rb_update_max_fd(int fd)
 void
 rb_maygvl_fd_fix_cloexec(int fd)
 {
+    /* On replay the fd is virtual -- served off the tape, never opened -- so close-on-exec
+     * is meaningless, and the fcntl(F_GETFD) below would rb_bug on the EBADF it gets. This
+     * is VM bookkeeping the program never sees; skip it, as rb_cloexec_open already does. */
+    if (rb_tape_replaying()) return;
   /* MinGW don't have F_GETFD and FD_CLOEXEC.  [ruby-core:40281] */
 #if defined(HAVE_FCNTL) && defined(F_GETFD) && defined(F_SETFD) && defined(FD_CLOEXEC)
     int flags, flags2, ret;
@@ -433,6 +437,10 @@ rb_cloexec_dup2(int oldfd, int newfd)
 static int
 rb_fd_set_nonblock(int fd)
 {
+    /* On replay the fd is virtual; its O_NONBLOCK bit means nothing (no real IO ever
+     * blocks -- it is served) and the fcntl below would EBADF. Skip it, same as the
+     * socket layer's rsock_make_fd_nonblock. */
+    if (rb_tape_replaying()) return 0;
 #ifdef _WIN32
     return rb_w32_set_nonblock(fd);
 #elif defined(F_GETFL)
@@ -5479,7 +5487,7 @@ rb_io_close_on_exec_p(VALUE io)
 
     GetOpenFile(io, fptr);
     if (fptr && 0 <= (fd = fptr->fd)) {
-        if ((ret = fcntl(fd, F_GETFD)) == -1) rb_sys_fail_path(fptr->pathv);
+        if ((ret = rb_tape_fcntl(fd, F_GETFD)) == -1) rb_sys_fail_path(fptr->pathv);
         if (!(ret & FD_CLOEXEC)) return Qfalse;
     }
     return Qtrue;
